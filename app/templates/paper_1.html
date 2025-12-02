@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GCE English Paper 1</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 20mm;
+    }
+
+    body {
+      font-family: "Times New Roman", Times, serif;
+      font-size: 11pt;
+      line-height: 1.35;
+      color: #000;
+      margin: 0;
+    }
+
+    .watermark {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) rotate(-30deg);
+      font-size: 24pt;
+      color: rgba(0, 0, 0, 0.08);
+      z-index: 0;
+      pointer-events: none;
+      white-space: nowrap;
+      text-transform: uppercase;
+    }
+
+    .page {
+      position: relative;
+      z-index: 1;
+      padding: 0;
+    }
+
+    /* Footer (avoid @frame/@bottom-* at-rules) */
+    #footer_content {
+      position: fixed;
+      bottom: 10mm;
+      left: 20mm;
+      right: 20mm;
+      font-size: 9pt;
+    }
+
+    .meta {
+      text-align: center;
+      margin-bottom: 6mm;
+    }
+
+    .meta-line {
+      margin: 1mm 0;
+    }
+
+    .exam-title {
+      font-weight: bold;
+      font-size: 16pt;
+      margin: 2mm 0;
+      text-transform: uppercase;
+    }
+
+    .exam-subtitle {
+      font-weight: bold;
+      font-size: 13pt;
+      margin: 2mm 0;
+      text-transform: uppercase;
+    }
+
+    .paper-code {
+      font-weight: bold;
+      font-size: 13pt;
+      margin-top: 3mm;
+    }
+
+    .paper-name {
+      font-weight: bold;
+      font-size: 12pt;
+      margin-top: 2mm;
+      text-transform: uppercase;
+    }
+
+    .session {
+      margin-top: 3mm;
+      font-size: 11pt;
+    }
+
+    .duration {
+      margin-top: 1mm;
+      font-size: 11pt;
+      font-weight: bold;
+    }
+
+    .hr {
+      border: 0;
+      border-top: 1px solid #000;
+      margin: 4mm 0;
+    }
+
+    .candidate-box {
+      border: 1px solid #000;
+      padding: 4mm 5mm 5mm 5mm;
+      margin-bottom: 5mm;
+    }
+
+    .candidate-title {
+      font-weight: bold;
+      text-transform: uppercase;
+      margin-bottom: 3mm;
+      font-size: 11pt;
+    }
+
+    .candidate-row {
+      display: flex;
+      margin-bottom: 2mm;
+    }
+
+    .candidate-label {
+      width: 28mm;
+      font-size: 10pt;
+    }
+
+    .candidate-dots {
+      border-bottom: 1px solid #000;
+      flex: 1;
+      height: 4mm;
+    }
+
+    .index-grid-label {
+      font-size: 10pt;
+      margin-top: 2mm;
+      margin-bottom: 1mm;
+    }
+
+    .index-grid {
+      display: inline-block;
+      border: 1px solid #000;
+      padding: 1mm;
+    }
+
+    .index-row {
+      display: flex;
+    }
+
+    .index-cell {
+      width: 7mm;
+      height: 7mm;
+      border: 1px solid #000;
+      text-align: center;
+      vertical-align: middle;
+      font-size: 10pt;
+      line-height: 7mm;
+    }
+
+    .instructions-title {
+      font-weight: bold;
+      text-transform: uppercase;
+      margin-top: 4mm;
+      margin-bottom: 2mm;
+      font-size: 11pt;
+    }
+
+    .instructions {
+      font-size: 10.5pt;
+      margin-bottom: 4mm;
+    }
+
+    .instructions ul {
+      margin: 0;
+      padding-left: 5mm;
+    }
+
+    .instructions li {
+      margin-bottom: 1mm;
+    }
+
+    .section {
+      font-weight: bold;
+      font-size: 12pt;
+      margin: 3mm 0 2mm 0;
+      text-transform: uppercase;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      font-family: "Times New Roman", Times, serif;
+      margin: 0;
+      font-size: 11pt;
+    }
+
+    .content {
+      margin-top: 4mm;
+      padding-bottom: 18mm; /* keep clear of footer */
+    }
+
+    /* P1 Section A tables */
+    table.p1a-lines, table.p1a-answers {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11pt;
+    }
+    table.p1a-lines th, table.p1a-lines td,
+    table.p1a-answers th, table.p1a-answers td {
+      border: 1px solid #000;
+      padding: 2mm 2mm;
+      vertical-align: top;
+    }
+    .p1a-answers-title {
+      font-weight: bold;
+      margin-bottom: 2mm;
+    }
+    .p1a-wrapper {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6mm;
+      align-items: flex-start;
+      margin-bottom: 6mm;
+    }
+    .p1a-column {
+      flex: 1 1 60%;
+    }
+    .p1a-answers-column {
+      flex: 0 0 35%;
+      min-width: 45mm;
+    }
+    table.p1a-answers td {
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <!-- Footer content for all pages -->
+  <div id="footer_content" style="width:100%; font-size:9pt;">
+    <table style="width:100%; border-collapse:collapse;">
+      <tr>
+        <td style="text-align:left;"></td>
+        <td style="text-align:right;">Page <pdf:pagenumber /> of <pdf:pagecount /></td>
+      </tr>
+    </table>
+  </div>
+
+  <!-- Optional watermark -->
+  {% if watermark_text %}
+  <div class="watermark">{{ watermark_text }}</div>
+  {% endif %}
+
+  <div class="page">
+
+    <!-- Header / Meta -->
+    <div class="meta">
+      <div class="meta-line exam-subtitle">MINISTRY OF EDUCATION, SINGAPORE</div>
+      <div class="meta-line">in collaboration with</div>
+      <div class="meta-line exam-subtitle">UNIVERSITY OF CAMBRIDGE LOCAL EXAMINATIONS SYNDICATE</div>
+      <div class="meta-line">General Certificate of Education Ordinary Level</div>
+      <div class="meta-line exam-title">ENGLISH LANGUAGE</div>
+      <div class="meta-line paper-code">1128/01</div>
+      <div class="meta-line paper-name">Paper 1 Writing</div>
+
+      {% if session or year %}
+      <div class="session">
+        {{ session if session else "" }}{% if session and year %}, {% endif %}{{ year if year else "" }}
+      </div>
+      {% endif %}
+
+      {% if duration %}
+      <div class="duration">
+        {{ duration }}
+      </div>
+      {% endif %}
+    </div>
+
+    <hr class="hr" />
+
+    <!-- Candidate information box -->
+    <div class="candidate-box">
+      <div class="candidate-title">Write your Centre Number, Index Number and Name on all the work you hand in.</div>
+
+      <div class="candidate-row">
+        <div class="candidate-label">Centre Number</div>
+        <div class="candidate-dots"></div>
+      </div>
+
+      <div class="candidate-row">
+        <div class="candidate-label">Name</div>
+        <div class="candidate-dots"></div>
+      </div>
+
+      <div class="index-grid-label">Index Number</div>
+      <div class="index-grid">
+        <div class="index-row">
+          <div class="index-cell">&nbsp;</div>
+          <div class="index-cell">&nbsp;</div>
+          <div class="index-cell">&nbsp;</div>
+          <div class="index-cell">&nbsp;</div>
+          <div class="index-cell">&nbsp;</div>
+          <div class="index-cell">&nbsp;</div>
+          <div class="index-cell">&nbsp;</div>
+          <div class="index-cell">&nbsp;</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Instructions -->
+    <div class="instructions-title">READ THESE INSTRUCTIONS FIRST</div>
+    <div class="instructions">
+      <ul>
+        <li>Answer the question in the spaces provided on the Question Paper.</li>
+        <li>Write in dark blue or black pen.</li>
+        <li>Do not use staples, paper clips, highlighters, glue or correction fluid.</li>
+        <li>All rough work should be done on the Question Paper.</li>
+        <li>At the end of the examination, hand in all your work.</li>
+      </ul>
+    </div>
+
+    <!-- Optional dynamic section heading -->
+    {% if section %}
+      <div class="section">{{ section.replace("_", " ").title() }}</div>
+    {% endif %}
+
+    <!-- Main content area -->
+    <div class="content">
+      {% if content_html %}
+        {{ content_html | safe }}
+      {% else %}
+        <pre>{{ content }}</pre>
+      {% endif %}
+    </div>
+
+  </div>
+</body>
+</html>
