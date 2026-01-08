@@ -1,0 +1,28 @@
+.cursor/
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Log files
+logs/
+*.log
+
+# Python cache files
+__pycache__/
+*.pyc 
+*.pyo
+*.pyd
+
+# Storage directories - keep directories, ignore contents
+storage/original_papers/*
+!storage/original_papers/.gitkeep
+storage/papers/*
+!storage/papers/.gitkeep
+storage/texts/*
+!storage/texts/.gitkeep
+storage/tmp/*
+!storage/tmp/.gitkeep
+storage/visuals/*
+!storage/visuals/.gitkeep
