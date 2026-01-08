@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     supabase_url: Optional[str] = None
     supabase_key: Optional[str] = None
 
+    # Supabase storage configuration
+    supabase_generated_papers_bucket: str = "Genrated_Papers"
+
+    # Auth / JWT configuration
+    jwt_secret_key: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expires_minutes: int = 60
+
     # Embedding configuration
     embedding_chunk_size: int = 1000
     embedding_chunk_overlap: int = 200

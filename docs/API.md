@@ -8,6 +8,8 @@ Interactive docs: `http://localhost:8000/docs`
 
 ## Table of Contents
 
+- [Auth Endpoints](#auth-endpoints)
+- [Document Endpoints](#document-endpoints)
 - [Document Endpoints](#document-endpoints)
   - [POST /documents/generate](#post-documentsgenerate)
   - [POST /documents/ingest](#post-documentsingest)
@@ -17,6 +19,111 @@ Interactive docs: `http://localhost:8000/docs`
   - [POST /sync/init-db](#post-syncinit-db)
   - [GET /sync/setup-sql](#get-syncsetup-sql)
   - [DELETE /sync/embeddings](#delete-syncembeddings)
+
+---
+
+## Auth Endpoints
+
+### GET /auth/setup-sql
+
+Get the SQL needed to create the `app_users` table in Supabase.
+
+**Example:**
+
+```bash
+curl http://localhost:8000/auth/setup-sql
+```
+
+**Response:**
+
+```json
+{
+  "instructions": "Run this SQL in Supabase Dashboard → SQL Editor to create the app_users table.",
+  "sql": "-- SQL content here..."
+}
+```
+
+---
+
+### POST /auth/signup
+
+Create a new user account.
+
+**Request Body:**
+
+```json
+{
+  "email": "user@example.com",
+  "password": "strongpassword",
+  "full_name": "Jane Doe"
+}
+```
+
+**Response:**
+
+```json
+{
+  "id": "c6c3c2a1-1234-5678-9abc-def012345678",
+  "email": "user@example.com",
+  "full_name": "Jane Doe",
+  "created_at": null
+}
+```
+
+---
+
+### POST /auth/login
+
+Authenticate a user and get a JWT access token.
+
+**Request Body:**
+
+```json
+{
+  "email": "user@example.com",
+  "password": "strongpassword"
+}
+```
+
+**Response:**
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+Use this token in the `Authorization` header for protected endpoints:
+
+```bash
+curl http://localhost:8000/auth/me \
+  -H "Authorization: Bearer <access_token>"
+```
+
+---
+
+### GET /auth/me
+
+Get the currently authenticated user from the JWT access token.
+
+**Example:**
+
+```bash
+curl http://localhost:8000/auth/me \
+  -H "Authorization: Bearer <access_token>"
+```
+
+**Response:**
+
+```json
+{
+  "id": "c6c3c2a1-1234-5678-9abc-def012345678",
+  "email": "user@example.com",
+  "full_name": "Jane Doe",
+  "created_at": null
+}
+```
 
 ---
 
@@ -111,7 +218,35 @@ curl -X POST http://localhost:8000/documents/generate \
   "text_path": "papers/paper_1-section_a-standard-20251202-183000.txt",
   "created_at": "2025-12-02T18:30:00.000Z",
   "preview": "Section A [10 marks]\n\nCarefully read the text below...",
-  "visual_meta": null
+  "visual_meta": null,
+  "download_url": "https://<project-ref>.supabase.co/storage/v1/object/sign/Genrated_Papers/<user_id>/paper1/paper_1-section_a-standard-20251202-183000.pdf?token=..."
+}
+```
+
+---
+
+### GET /documents/download-link
+
+Get a public download URL for a generated paper PDF stored in Supabase Storage.
+
+**Query Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file_name` | string | Yes | File name of the generated PDF as stored in Supabase (e.g. `paper_1-section_a-standard-20251202-183000.pdf`) |
+
+**Example:**
+
+```bash
+curl "http://localhost:8000/documents/download-link?file_name=paper_1-section_a-standard-20251202-183000.pdf"
+```
+
+**Response:**
+
+```json
+{
+  "file_name": "paper_1-section_a-standard-20251202-183000.pdf",
+  "download_url": "https://<project-ref>.supabase.co/storage/v1/object/public/Genrated_Papers/paper_1-section_a-standard-20251202-183000.pdf"
 }
 ```
 

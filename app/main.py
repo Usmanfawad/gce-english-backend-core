@@ -1,12 +1,19 @@
 from datetime import datetime
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.auth.router import router as auth_router
+from app.api.auth.security import get_current_user, require_admin_user
 from app.api.documents.router import router as documents_router
 from app.api.sync.router import router as sync_router
-from app.config.logger import app_logger, log_request_end, log_request_error, log_request_start
+from app.config.logger import (
+    app_logger,
+    log_request_end,
+    log_request_error,
+    log_request_start,
+)
 from app.config.settings import settings
-
 
 app = FastAPI(
     title=settings.app_name,
@@ -29,22 +36,22 @@ app.add_middleware(
 async def log_requests(request: Request, call_next):
     """Log all HTTP requests with timing information using Loguru."""
     start_time = datetime.now()
-    
+
     # Log request start
     log_request_start(request)
-    
+
     # Process request
     try:
         response = await call_next(request)
-        
+
         # Calculate processing time
         process_time = (datetime.now() - start_time).total_seconds()
-        
+
         # Log response
         log_request_end(request, response.status_code, process_time)
-        
+
         return response
-        
+
     except Exception as e:
         # Log error
         process_time = (datetime.now() - start_time).total_seconds()
@@ -65,12 +72,19 @@ async def root():
     }
 
 
-app.include_router(documents_router)
-app.include_router(sync_router)
-
+app.include_router(
+    documents_router,
+    dependencies=[Depends(get_current_user)],
+)
+app.include_router(
+    sync_router,
+    dependencies=[Depends(require_admin_user)],
+)
+app.include_router(auth_router)
 
 
 if __name__ == "__main__":
     import uvicorn
+
     app_logger.info("Starting GCE English backend server")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)

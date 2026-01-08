@@ -407,26 +407,39 @@ def _llm_candidate_urls(topics: Iterable[str], paper_format: str, section: Optio
     section_str = section or "full"
     prompt = (
         "You are sourcing PUBLIC, HEADLESS-BROWSER-FRIENDLY HTML pages that can act as visual stimuli for a "
-        "GCE English examination paper. I will screenshot the page exactly as rendered on a desktop monitor "
+        "GCE O-Level English examination paper. I will screenshot the page exactly as rendered on a desktop monitor "
         "and embed it beside the question.\n\n"
         "STRICT REQUIREMENTS:\n"
         "1. Output ONLY a JSON array of fully qualified HTTPS URLs (no commentary, no code fences).\n"
         "2. Each URL must render a visually rich layout within the first viewport: hero banner, callouts, promo panels, "
         "infographic blocks, or clearly structured headings + subtext.\n"
         "3. Must be freely accessible (no login, no paywall, no heavy cookie wall) and not rely on infinite scrolling.\n"
-        "4. Prefer .com / .org / .travel / .museum / .edu domains for travel boards, tourism campaigns, airlines, cruise lines, hotels, "
-        "museums, community events, non-profits, public awareness campaigns, universities, or lifestyle brands.\n"
-        "5. HARD-BLOCK these categories/domains: social media (facebook, instagram, tiktok, youtube, twitter/x, reddit), "
-        "Q&A forums (quora / stackoverflow), news paywalls (nytimes, washingtonpost, cnn), government or UN/UNESCO domains, "
-        "exam-prep sites, PDF-only resources, and any site known to detect/break headless Chromium (cloudflare challenge pages).\n"
-        "6. Avoid generic homepages—return specific landing pages, event/announcement pages, promotional microsites, or campaign pages that "
-        "tie directly to the requested topics.\n"
+        "4. PREFERRED CONTENT TYPES for O-Level English visual text comprehension:\n"
+        "   - Community event announcements (festivals, exhibitions, charity events)\n"
+        "   - Educational program pages (workshops, courses, summer camps)\n"
+        "   - Environmental/sustainability campaigns\n"
+        "   - Health and wellness initiatives\n"
+        "   - Youth programs and school activities\n"
+        "   - Cultural and arts events\n"
+        "   - Library/museum exhibitions and programs\n"
+        "   - Volunteer opportunities\n"
+        "   - Sports and recreation programs\n"
+        "5. HARD-BLOCK these categories/domains:\n"
+        "   - Social media (facebook, instagram, tiktok, youtube, twitter/x, reddit)\n"
+        "   - Q&A forums (quora / stackoverflow)\n"
+        "   - News paywalls (nytimes, washingtonpost, cnn)\n"
+        "   - Government or UN/UNESCO domains\n"
+        "   - Exam-prep sites, PDF-only resources\n"
+        "   - VISA/IMMIGRATION related content (visa applications, immigration services, work permits, etc.)\n"
+        "   - Commercial advertisements (mock ads, product ads, services selling)\n"
+        "   - Sites with heavy cloudflare protection\n"
+        "6. Avoid generic homepages—return specific landing pages, event/announcement pages, or campaign pages.\n"
         "7. At least 5 and up to 8 unique URLs, all different hosts.\n\n"
         f"CONTEXT:\n"
         f"- Paper format: {paper_format}\n"
         f"- Section: {section_str}\n"
         f"- Topics to reflect: {topic_str}\n"
-        f"- Desired tone: modern Singapore GCE English exam stimulus.\n\n"
+        f"- Desired tone: modern Singapore GCE O-Level English exam stimulus.\n\n"
         "Respond with JSON only, e.g. [\"https://example.com/page\", \"https://travel.org/event\"]."
     )
     resp = client.chat.completions.create(
@@ -508,6 +521,53 @@ def _tavily_urls(topics: Optional[List[str]] = None) -> List[str]:
         "unacademy.com",
         "unesco.org",
         "un.org",
+        "scribd.com",
+        "pinterest.com",
+        "postermywall.com",
+        "arxiv.org",
+        "museumofscience.org",
+        "cookridgeprimary.co.uk"
+        "anaheim.net"
+        # Immigration/visa related domains
+        "ica.gov.sg",
+        "immigration",
+        "visa",
+        "immi.gov",
+        "uscis.gov",
+        "ukvi",
+        "homeoffice.gov",
+    ]
+
+    # Keywords to filter out from URLs (immigration/visa/ads/government related)
+    excluded_keywords = [
+        "visa",
+        "immigration",
+        "immi",
+        "passport",
+        "citizenship",
+        "residency",
+        "work-permit",
+        "green-card",
+        "pr-application",
+        "migrate",
+        "ads",
+        "advertisement",
+        "sponsor",
+        "affiliate",
+        # Government/municipal website patterns
+        "cityof",
+        "city-of",
+        "countyof",
+        "county-of",
+        "stateof",
+        "state-of",
+        "townof",
+        "town-of",
+        "government",
+        "municipal",
+        "council",
+        "public-services",
+        "civic",
     ]
 
     filtered: List[str] = []
@@ -517,7 +577,14 @@ def _tavily_urls(topics: Optional[List[str]] = None) -> List[str]:
             continue
         if any(dom in lower for dom in excluded_domains):
             continue
+        if any(kw in lower for kw in excluded_keywords):
+            logger.debug(f"Filtered out URL with excluded keyword: {url}")
+            continue
         if ".gov" in lower:
+            continue
+        # Filter government-style .net/.org domains
+        if "city" in lower and any(ext in lower for ext in [".net", ".org", ".us"]):
+            logger.debug(f"Filtered out government-style URL: {url}")
             continue
         filtered.append(url)
 
@@ -550,17 +617,29 @@ def _openai_web_search_urls(topics: Optional[List[str]] = None) -> List[str]:
             topic_str = ", ".join(topics)
             search_query = (
                 "You are sourcing publicly accessible HTML web pages that contain rich visual stimulus content "
-                "to inspire GCE English examination questions.\n\n"
+                "for GCE O-Level English examination questions.\n\n"
                 f"TARGET TOPICS: {topic_str}\n\n"
                 "REQUIREMENTS:\n"
                 "1. The page must be publicly accessible (no login/paywall) and render in a headless Chromium browser.\n"
                 "2. Content must feature clear visual layout elements visible within the initial viewport after a small scroll "
                 "(hero banners, callouts, headings, infographics, promotional sections, etc.).\n"
-                "3. Prefer travel, tourism, museum, cultural institution, community event, NGO, educational outreach, "
-                "public awareness, or wellness campaign pages.\n"
-                "4. STRICTLY AVOID social media, Q&A forums, video-only sites, news paywalls, exam-prep sites, government PDFs, "
-                "and domains known to block automation (facebook.com, instagram.com, tiktok.com, youtube.com, quora.com, "
-                "reddit.com, nytimes.com, washingtonpost.com, cnn.com, *.gov, cambridge.org, cie.org.uk, unesco.org, un.org, etc.).\n"
+                "3. PREFERRED CONTENT TYPES for O-Level English:\n"
+                "   - Community event announcements (festivals, exhibitions, charity events)\n"
+                "   - Educational program pages (workshops, courses, summer camps)\n"
+                "   - Environmental/sustainability campaigns\n"
+                "   - Health and wellness initiatives\n"
+                "   - Youth programs and school activities\n"
+                "   - Cultural and arts events\n"
+                "   - Library/museum exhibitions and programs\n"
+                "   - Volunteer opportunities\n"
+                "   - Sports and recreation programs\n"
+                "4. STRICTLY AVOID:\n"
+                "   - Social media, Q&A forums, video-only sites, news paywalls\n"
+                "   - Exam-prep sites, government PDFs\n"
+                "   - VISA/IMMIGRATION content (visa applications, immigration services, work permits)\n"
+                "   - Commercial advertisements and mock ads\n"
+                "   - Domains: facebook.com, instagram.com, tiktok.com, youtube.com, quora.com, "
+                "reddit.com, nytimes.com, washingtonpost.com, cnn.com, *.gov, cambridge.org, cie.org.uk, unesco.org, un.org\n"
                 "5. The final screenshot should make sense on its own; therefore, URLs that are mostly text with no layout cues "
                 "should be skipped.\n\n"
                 "TASK:\n"
@@ -571,9 +650,10 @@ def _openai_web_search_urls(topics: Optional[List[str]] = None) -> List[str]:
         else:
             search_query = (
                 "Find publicly accessible HTML pages with visually rich layouts (banners, callouts, headings) suitable for "
-                "GCE English visual stimulus questions. Prefer travel/tourism/museum/event/NGO pages. Avoid social media, "
-                "Q&A, paywalled news, government PDFs, or exam-prep sites. Use web_search. Return ONLY a JSON array of "
-                'https URLs like ["https://example.com", ...] with at least 12 entries.'
+                "GCE O-Level English visual stimulus questions. Prefer community events, educational programs, environmental "
+                "campaigns, cultural events, youth activities, library/museum programs, volunteer opportunities. "
+                "AVOID social media, Q&A, paywalled news, government PDFs, exam-prep sites, AND visa/immigration content. "
+                "Use web_search. Return ONLY a JSON array of https URLs like [\"https://example.com\", ...] with at least 12 entries."
             )
 
         response = client.responses.create(
@@ -638,6 +718,53 @@ def _openai_web_search_urls(topics: Optional[List[str]] = None) -> List[str]:
             "unacademy.com",
             "unesco.org",
             "un.org",
+            "scribd.com",
+            "pinterest.com",
+            "postermywall.com",
+            "arxiv.org",
+            "museumofscience.org",
+            "cookridgeprimary.co.uk",
+            # Immigration/visa related domains
+            "ica.gov.sg",
+            "immigration",
+            "visa",
+            "immi.gov",
+            "uscis.gov",
+            "ukvi",
+            "homeoffice.gov",
+            "anaheim.net",
+        ]
+
+        # Keywords to filter out from URLs (immigration/visa/ads/government related)
+        excluded_keywords = [
+            "visa",
+            "immigration",
+            "immi",
+            "passport",
+            "citizenship",
+            "residency",
+            "work-permit",
+            "green-card",
+            "pr-application",
+            "migrate",
+            "ads",
+            "advertisement",
+            "sponsor",
+            "affiliate",
+            # Government/municipal website patterns
+            "cityof",
+            "city-of",
+            "countyof",
+            "county-of",
+            "stateof",
+            "state-of",
+            "townof",
+            "town-of",
+            "government",
+            "municipal",
+            "council",
+            "public-services",
+            "civic",
         ]
 
         for url in urls:
@@ -648,8 +775,15 @@ def _openai_web_search_urls(topics: Optional[List[str]] = None) -> List[str]:
             if any(excluded in url_lower for excluded in excluded_domains):
                 logger.debug(f"Filtered out excluded domain: {url}")
                 continue
+            if any(kw in url_lower for kw in excluded_keywords):
+                logger.debug(f"Filtered out URL with excluded keyword: {url}")
+                continue
             if ".gov" in url_lower:
                 logger.debug(f"Filtered out government domain: {url}")
+                continue
+            # Filter government-style .net/.org domains
+            if "city" in url_lower and any(ext in url_lower for ext in [".net", ".org", ".us"]):
+                logger.debug(f"Filtered out government-style URL: {url}")
                 continue
             filtered_urls.append(url)
 

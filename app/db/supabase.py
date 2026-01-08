@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from dataclasses import dataclass
+from pathlib import Path
 
 from loguru import logger
 from supabase import create_client, Client
@@ -451,3 +452,107 @@ def clear_embeddings(source_file: Optional[str] = None) -> int:
         
     except Exception as exc:
         raise SupabaseError(f"Failed to clear embeddings: {exc}") from exc
+
+
+def _extract_signed_or_public_url(result: Union[str, Dict[str, Any]]) -> str:
+    """Normalise URL result from Supabase storage client (public or signed).
+
+    Supabase Python client can return either a plain string or a dict with keys like
+    'publicUrl', 'public_url', 'signedURL', 'signedUrl', or 'url', optionally wrapped
+    under a 'data' field. This helper extracts the first matching URL string.
+    """
+    if isinstance(result, str):
+        return result
+
+    def _from_dict(d: Dict[str, Any]) -> Optional[str]:
+        for key in ("signedURL", "signedUrl", "publicUrl", "public_url", "url"):
+            if key in d and isinstance(d[key], str):
+                return d[key]
+        return None
+
+    if isinstance(result, dict):
+        url = _from_dict(result)
+        if url:
+            return url
+        data = result.get("data")
+        if isinstance(data, dict):
+            url = _from_dict(data)
+            if url:
+                return url
+
+    raise SupabaseError("Unexpected response format when retrieving URL from Supabase storage")
+
+
+def upload_generated_paper_pdf(
+    local_pdf: Path,
+    *,
+    bucket: Optional[str] = None,
+    object_key: Optional[str] = None,
+) -> str:
+    """Upload a generated PDF to Supabase Storage and return its public URL.
+
+    Args:
+        local_pdf: Path to the locally generated PDF file.
+        bucket: Optional override for the storage bucket name.
+        object_key: Optional object key (path inside the bucket). If not provided,
+            the local file name is used at the bucket root.
+
+    Returns:
+        Public URL to access the uploaded PDF.
+
+    Raises:
+        SupabaseError: if upload or public URL retrieval fails.
+    """
+    client = get_supabase_client()
+    bucket_name = bucket or settings.supabase_generated_papers_bucket
+
+    if not local_pdf.exists():
+        raise SupabaseError(f"Local PDF not found for upload: {local_pdf}")
+
+    storage_key = object_key or local_pdf.name
+
+    try:
+        with local_pdf.open("rb") as f:
+            # supabase-py storage upload: upload(path, file)
+            client.storage.from_(bucket_name).upload(storage_key, f)
+    except Exception as exc:  # pragma: no cover - depends on external service
+        raise SupabaseError(f"Failed to upload PDF to Supabase Storage: {exc}") from exc
+
+    try:
+        # Generate a signed URL (private bucket) valid for 7 days (in seconds)
+        resp = client.storage.from_(bucket_name).create_signed_url(
+            storage_key,
+            expires_in=7 * 24 * 60 * 60,
+        )
+        signed_url = _extract_signed_or_public_url(resp)
+    except Exception as exc:  # pragma: no cover - depends on external service
+        raise SupabaseError(f"Failed to create signed URL for uploaded PDF: {exc}") from exc
+
+    logger.info(f"Uploaded generated paper to Supabase storage bucket='{bucket_name}', key='{storage_key}'")
+    return signed_url
+
+
+def get_generated_paper_public_url(file_name: str, *, bucket: Optional[str] = None) -> str:
+    """Return the public URL for a previously uploaded generated paper PDF.
+
+    Args:
+        file_name: File name (key) used when uploading to the storage bucket.
+        bucket: Optional override for the storage bucket name.
+
+    Returns:
+        Public URL to access the file.
+
+    Raises:
+        SupabaseError: if URL retrieval fails.
+    """
+    client = get_supabase_client()
+    bucket_name = bucket or settings.supabase_generated_papers_bucket
+
+    try:
+        resp = client.storage.from_(bucket_name).create_signed_url(
+            file_name,
+            expires_in=7 * 24 * 60 * 60,
+        )
+        return _extract_signed_or_public_url(resp)
+    except Exception as exc:  # pragma: no cover - depends on external service
+        raise SupabaseError(f"Failed to create signed URL for file '{file_name}' in bucket '{bucket_name}': {exc}") from exc

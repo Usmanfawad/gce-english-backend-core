@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>GCE English Paper 1</title>
+  <title>GCE English Oral Examination</title>
   <style>
     @page {
       size: A4;
@@ -12,7 +12,7 @@
     body {
       font-family: "Times New Roman", Times, serif;
       font-size: 11pt;
-      line-height: 1.35;
+      line-height: 1.4;
       color: #000;
       margin: 0;
     }
@@ -36,7 +36,6 @@
       padding: 0;
     }
 
-    /* Footer (avoid @frame/@bottom-* at-rules) */
     #footer_content {
       position: fixed;
       bottom: 10mm;
@@ -98,6 +97,27 @@
       margin: 4mm 0;
     }
 
+    .examiner-box {
+      border: 2px solid #000;
+      padding: 4mm 5mm;
+      margin-bottom: 5mm;
+      background-color: #f9f9f9;
+    }
+
+    .examiner-title {
+      font-weight: bold;
+      text-transform: uppercase;
+      margin-bottom: 2mm;
+      font-size: 12pt;
+      color: #333;
+    }
+
+    .examiner-note {
+      font-style: italic;
+      font-size: 10pt;
+      color: #555;
+    }
+
     .candidate-box {
       border: 1px solid #000;
       padding: 4mm 5mm 5mm 5mm;
@@ -153,33 +173,82 @@
       line-height: 7mm;
     }
 
-    .instructions-title {
+    .component-header {
       font-weight: bold;
+      font-size: 14pt;
+      margin: 6mm 0 3mm 0;
       text-transform: uppercase;
-      margin-top: 4mm;
-      margin-bottom: 2mm;
-      font-size: 11pt;
+      border-bottom: 2px solid #000;
+      padding-bottom: 2mm;
     }
 
-    .instructions {
-      font-size: 10.5pt;
+    .component-marks {
+      font-weight: normal;
+      font-size: 12pt;
+    }
+
+    .timing-info {
+      font-size: 10pt;
+      font-style: italic;
       margin-bottom: 4mm;
-    }
-
-    .instructions ul {
-      margin: 0;
-      padding-left: 5mm;
-    }
-
-    .instructions li {
-      margin-bottom: 1mm;
+      color: #333;
     }
 
     .section {
       font-weight: bold;
       font-size: 12pt;
-      margin: 3mm 0 2mm 0;
+      margin: 4mm 0 2mm 0;
       text-transform: uppercase;
+    }
+
+    .theme-box {
+      border: 1px solid #ccc;
+      padding: 3mm;
+      margin: 3mm 0;
+      background-color: #fafafa;
+    }
+
+    .theme-title {
+      font-weight: bold;
+      font-size: 11pt;
+      margin-bottom: 2mm;
+    }
+
+    .question-list {
+      margin: 0;
+      padding-left: 5mm;
+    }
+
+    .question-list li {
+      margin-bottom: 2mm;
+    }
+
+    .visual-stimulus-box {
+      border: 2px solid #000;
+      padding: 4mm;
+      margin: 4mm 0;
+      background-color: #f5f5f5;
+    }
+
+    .stimulus-label {
+      font-weight: bold;
+      font-size: 10pt;
+      text-transform: uppercase;
+      margin-bottom: 2mm;
+      color: #555;
+    }
+
+    .pronunciation-guide {
+      background-color: #fff8e6;
+      border: 1px solid #e6d5a8;
+      padding: 3mm;
+      margin: 3mm 0;
+    }
+
+    .pronunciation-title {
+      font-weight: bold;
+      font-size: 10pt;
+      margin-bottom: 2mm;
     }
 
     pre {
@@ -191,7 +260,7 @@
 
     .content {
       margin-top: 4mm;
-      padding-bottom: 18mm; /* keep clear of footer */
+      padding-bottom: 18mm;
       line-height: 1.5;
     }
 
@@ -199,6 +268,19 @@
       display: block;
       margin: 2mm 0;
       content: "";
+    }
+
+    .page-break {
+      page-break-before: always;
+    }
+
+    .page-break-before {
+      page-break-before: always;
+      margin-top: 0;
+    }
+
+    .no-break {
+      page-break-inside: avoid;
     }
 
     .section-header {
@@ -216,61 +298,6 @@
       font-weight: normal;
       font-size: 12pt;
     }
-
-    .component-header {
-      font-weight: bold;
-      font-size: 14pt;
-      margin: 10mm 0 6mm 0;
-      text-transform: uppercase;
-      border-bottom: 2px solid #000;
-      padding-bottom: 3mm;
-      clear: both;
-      display: block;
-    }
-
-    .component-marks {
-      font-weight: normal;
-      font-size: 12pt;
-    }
-
-    .page-break-before {
-      page-break-before: always;
-      margin-top: 0;
-    }
-
-    /* P1 Section A tables */
-    table.p1a-lines, table.p1a-answers {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 11pt;
-    }
-    table.p1a-lines th, table.p1a-lines td,
-    table.p1a-answers th, table.p1a-answers td {
-      border: 1px solid #000;
-      padding: 2mm 2mm;
-      vertical-align: top;
-    }
-    .p1a-answers-title {
-      font-weight: bold;
-      margin-bottom: 2mm;
-    }
-    .p1a-wrapper {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6mm;
-      align-items: flex-start;
-      margin-bottom: 6mm;
-    }
-    .p1a-column {
-      flex: 1 1 60%;
-    }
-    .p1a-answers-column {
-      flex: 0 0 35%;
-      min-width: 45mm;
-    }
-    table.p1a-answers td {
-      white-space: nowrap;
-    }
   </style>
 </head>
 <body>
@@ -278,7 +305,6 @@
   <div id="footer_content" style="width:100%; font-size:9pt;">
     <table style="width:100%; border-collapse:collapse;">
       <tr>
-        <td style="text-align:left;"></td>
         <td style="text-align:right;">Page <pdf:pagenumber /> of <pdf:pagecount /></td>
       </tr>
     </table>
@@ -298,8 +324,8 @@
       <div class="meta-line exam-subtitle">UNIVERSITY OF CAMBRIDGE LOCAL EXAMINATIONS SYNDICATE</div>
       <div class="meta-line">General Certificate of Education Ordinary Level</div>
       <div class="meta-line exam-title">ENGLISH LANGUAGE</div>
-      <div class="meta-line paper-code">1128/01</div>
-      <div class="meta-line paper-name">Paper 1 Writing</div>
+      <div class="meta-line paper-code">1128/03</div>
+      <div class="meta-line paper-name">Oral Communication</div>
 
       {% if session or year %}
       <div class="session">
@@ -316,9 +342,18 @@
 
     <hr class="hr" />
 
+    <!-- Examiner Information Box -->
+    <div class="examiner-box">
+      <div class="examiner-title">Examiner's Copy</div>
+      <div class="examiner-note">
+        This document contains the examination materials and examiner notes.
+        Do not distribute to candidates.
+      </div>
+    </div>
+
     <!-- Candidate information box -->
     <div class="candidate-box">
-      <div class="candidate-title">Write your Centre Number, Index Number and Name on all the work you hand in.</div>
+      <div class="candidate-title">Candidate Details (for examiner's record)</div>
 
       <div class="candidate-row">
         <div class="candidate-label">Centre Number</div>
@@ -345,22 +380,34 @@
       </div>
     </div>
 
-    <!-- Instructions -->
-    <div class="instructions-title">READ THESE INSTRUCTIONS FIRST</div>
-    <div class="instructions">
-      <ul>
-        <li>Answer the question in the spaces provided on the Question Paper.</li>
-        <li>Write in dark blue or black pen.</li>
-        <li>Do not use staples, paper clips, highlighters, glue or correction fluid.</li>
-        <li>All rough work should be done on the Question Paper.</li>
-        <li>At the end of the examination, hand in all your work.</li>
-      </ul>
-    </div>
-
-    <!-- Optional dynamic section heading -->
-    {% if section %}
-      <div class="section">{{ section.replace("_", " ").title() }}</div>
-    {% endif %}
+    <!-- Assessment Summary -->
+    <table style="width:100%; border-collapse:collapse; margin-bottom:4mm; font-size:10pt;">
+      <tr style="background-color:#f0f0f0;">
+        <th style="border:1px solid #000; padding:2mm; text-align:left;">Component</th>
+        <th style="border:1px solid #000; padding:2mm; text-align:center; width:20mm;">Marks</th>
+        <th style="border:1px solid #000; padding:2mm; text-align:center; width:25mm;">Score</th>
+      </tr>
+      <tr>
+        <td style="border:1px solid #000; padding:2mm;">Reading Aloud</td>
+        <td style="border:1px solid #000; padding:2mm; text-align:center;">10</td>
+        <td style="border:1px solid #000; padding:2mm;"></td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #000; padding:2mm;">Stimulus-Based Conversation</td>
+        <td style="border:1px solid #000; padding:2mm; text-align:center;">20</td>
+        <td style="border:1px solid #000; padding:2mm;"></td>
+      </tr>
+      <tr>
+        <td style="border:1px solid #000; padding:2mm;">General Conversation</td>
+        <td style="border:1px solid #000; padding:2mm; text-align:center;">20</td>
+        <td style="border:1px solid #000; padding:2mm;"></td>
+      </tr>
+      <tr style="font-weight:bold; background-color:#f0f0f0;">
+        <td style="border:1px solid #000; padding:2mm;">TOTAL</td>
+        <td style="border:1px solid #000; padding:2mm; text-align:center;">50</td>
+        <td style="border:1px solid #000; padding:2mm;"></td>
+      </tr>
+    </table>
 
     <!-- Main content area -->
     <div class="content">

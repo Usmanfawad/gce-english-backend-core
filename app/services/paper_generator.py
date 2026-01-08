@@ -18,9 +18,11 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from app.config.settings import settings
+from app.db.supabase import upload_generated_paper_pdf, SupabaseError
 from app.services.visuals import get_visual, VisualSnapshot
 from app.services.html_renderer import html_to_pdf, render_html_template
 from app.services.rag import get_rag_enhanced_prompt
+from app.services.answer_key import generate_answer_key, save_answer_key_json, render_answer_key_pdf, AnswerKeyError
 
 
 class PaperGenerationError(RuntimeError):
@@ -38,6 +40,10 @@ class PaperGenerationResult:
     created_at: datetime
     section: Optional[str]
     visual_meta: Optional[Dict[str, str]] = None
+    download_url: Optional[str] = None
+    answer_key: Optional[Dict[str, any]] = None
+    answer_key_pdf_path: Optional[Path] = None
+    section_a_error_key: Optional[Dict[str, any]] = None  # Pre-extracted error key for Section A
 
 
 LLM_COMPLETION_PARAMS = {
@@ -47,6 +53,311 @@ LLM_COMPLETION_PARAMS = {
     "presence_penalty": 0.0,
     "max_tokens": 6000,
 }
+
+# Section-specific temperature tuning
+SECTION_TEMPERATURE = {
+    # Paper 1
+    "paper_1_section_a": 0.2,   # Editing - needs precision
+    "paper_1_section_b": 0.4,   # Situational - moderate creativity
+    "paper_1_section_c": 0.5,   # Continuous - needs prompt creativity
+    # Paper 2
+    "paper_2_section_a": 0.3,   # Visual text - factual
+    "paper_2_section_b": 0.35,  # Comprehension - balanced
+    "paper_2_section_c": 0.35,  # Summary - balanced
+    # Oral
+    "oral_reading_aloud": 0.4,  # Reading - moderate creativity for passage
+    "oral_sbc": 0.45,           # SBC - needs engaging stimulus
+    "oral_conversation": 0.4,   # Conversation - needs varied themes
+}
+
+# Content validation rules
+VALIDATION_RULES = {
+    "paper_1_section_a": {
+        "min_lines": 12,
+        "max_lines": 15,
+        "required_patterns": [r"^\d+\.\s", r"Section\s*A"],  # Line numbers, section header
+        "forbidden_patterns": [r"\[error\]", r"\[correction\]"],  # Don't expose errors
+    },
+    "paper_1_section_b": {
+        "min_words": 200,
+        "max_words": 500,
+        "required_patterns": [r"Section\s*B", r"\d+\s*marks?"],  # Section header, marks
+    },
+    "paper_1_section_c": {
+        "min_prompts": 4,
+        "max_prompts": 4,
+        "required_patterns": [r"Section\s*C", r"\d+\s*marks?"],
+    },
+    "paper_2_section_a": {
+        "min_questions": 4,
+        "required_patterns": [r"Section\s*A", r"\d+\s*marks?"],
+    },
+    "paper_2_section_b": {
+        "min_questions": 6,
+        "min_words": 500,  # Passage length (narrative)
+        "required_patterns": [r"Section\s*B", r"\d+\s*marks?", r"flowchart|sequence"],
+    },
+    "paper_2_section_c": {
+        "min_questions": 4,
+        "required_patterns": [r"Section\s*C", r"summary", r"\d+\s*marks?"],
+    },
+}
+
+
+def _get_section_temperature(paper_format: str, section: Optional[str]) -> float:
+    """Get the appropriate temperature for a section."""
+    if section:
+        key = f"{paper_format}_{section}"
+    else:
+        key = paper_format
+    return SECTION_TEMPERATURE.get(key, LLM_COMPLETION_PARAMS["temperature"])
+
+
+def _extract_section_a_error_key(content: str) -> Tuple[str, Optional[Dict[str, any]]]:
+    """
+    Extract the error key from Section A content and return cleaned content + error data.
+
+    The error key is expected in format:
+    ===ERROR_KEY_START===
+    Line X: "incorrect_word" should be "correct_word" (error_type)
+    ...
+    Correct lines: [1, 5, 12]
+    ===ERROR_KEY_END===
+
+    Returns:
+        Tuple of (cleaned_content, error_key_dict or None)
+    """
+    import re
+
+    error_key_pattern = r'===ERROR_KEY_START===\s*(.*?)\s*===ERROR_KEY_END==='
+    match = re.search(error_key_pattern, content, re.DOTALL)
+
+    if not match:
+        logger.warning("No error key found in Section A content")
+        return content, None
+
+    error_key_text = match.group(1).strip()
+    cleaned_content = re.sub(error_key_pattern, '', content, flags=re.DOTALL).strip()
+
+    # Parse the error key
+    errors = []
+    correct_lines = []
+
+    # Parse error lines: Line X: "incorrect_word" should be "correct_word" (error_type)
+    error_line_pattern = r'Line\s+(\d+):\s*["\']?([^"\']+)["\']?\s+should\s+be\s+["\']?([^"\']+)["\']?\s*\(([^)]+)\)'
+    for err_match in re.finditer(error_line_pattern, error_key_text, re.IGNORECASE):
+        errors.append({
+            "line": int(err_match.group(1)),
+            "error": err_match.group(2).strip(),
+            "correction": err_match.group(3).strip(),
+            "error_type": err_match.group(4).strip(),
+        })
+
+    # Parse correct lines: Correct lines: [1, 5, 12] or Correct lines: 1, 5, 12
+    correct_pattern = r'Correct\s+lines?:\s*\[?([^\]]+)\]?'
+    correct_match = re.search(correct_pattern, error_key_text, re.IGNORECASE)
+    if correct_match:
+        correct_str = correct_match.group(1)
+        correct_lines = [int(n.strip()) for n in re.findall(r'\d+', correct_str)]
+
+    error_key_data = {
+        "errors": errors,
+        "correct_lines": correct_lines,
+        "total_errors": len(errors),
+    }
+
+    logger.info(f"Extracted Section A error key: {len(errors)} errors, correct lines: {correct_lines}")
+
+    return cleaned_content, error_key_data
+
+
+def _extract_flowchart_answer_key(content: str) -> Tuple[str, Optional[Dict[str, any]]]:
+    """
+    Extract the flowchart answer key from Section B content and return cleaned content + answer data.
+
+    The answer key is expected in format:
+    ===FLOWCHART_ANSWER_KEY_START===
+    Paragraph 2: A (reason: ...)
+    ...
+    Distractors: B, E
+    ===FLOWCHART_ANSWER_KEY_END===
+
+    Returns:
+        Tuple of (cleaned_content, flowchart_answer_dict or None)
+    """
+    import re
+
+    answer_key_pattern = r'===FLOWCHART_ANSWER_KEY_START===\s*(.*?)\s*===FLOWCHART_ANSWER_KEY_END==='
+    match = re.search(answer_key_pattern, content, re.DOTALL)
+
+    flowchart_data = None
+
+    if match:
+        answer_key_text = match.group(1).strip()
+        content = re.sub(answer_key_pattern, '', content, flags=re.DOTALL).strip()
+
+        # Parse the answer key
+        answers = {}
+        distractors = []
+
+        # Parse paragraph answers: Paragraph X: Y (reason: ...)
+        para_pattern = r'Paragraph\s+(\d+):\s*([A-F])\s*(?:\(reason:\s*([^)]+)\))?'
+        for para_match in re.finditer(para_pattern, answer_key_text, re.IGNORECASE):
+            para_num = int(para_match.group(1))
+            answer = para_match.group(2).upper()
+            reason = para_match.group(3).strip() if para_match.group(3) else ""
+            answers[f"paragraph_{para_num}"] = {"answer": answer, "reason": reason}
+
+        # Parse distractors: Distractors: B, E
+        distractor_pattern = r'Distractors?:\s*([A-F,\s]+)'
+        distractor_match = re.search(distractor_pattern, answer_key_text, re.IGNORECASE)
+        if distractor_match:
+            distractor_str = distractor_match.group(1)
+            distractors = [d.strip().upper() for d in re.findall(r'[A-F]', distractor_str)]
+
+        flowchart_data = {
+            "answers": answers,
+            "distractors": distractors,
+        }
+
+        logger.info(f"Extracted flowchart answer key: {len(answers)} answers, distractors: {distractors}")
+
+    # Also clean up any remaining flowchart answers that might appear in student content
+    # Pattern: "Paragraph X: [A-F]" without the [____] blank
+    # We want to replace "Paragraph 2: A" with "Paragraph 2: [____]"
+    content = _clean_flowchart_answers(content)
+
+    return content, flowchart_data
+
+
+def _clean_flowchart_answers(content: str) -> str:
+    """
+    Remove any flowchart answers that appear in the student content.
+    Replace "Paragraph X: A" with "Paragraph X: [____]"
+    """
+    import re
+
+    # Pattern to match flowchart answers like "Paragraph 2: A" or "Paragraph 3: C"
+    # but NOT lines that already have blanks like "Paragraph 2: [____]"
+    # Also handle variations like "│ Paragraph 2: A" in box drawings
+
+    def replace_answer(match):
+        prefix = match.group(1) if match.group(1) else ""
+        para_num = match.group(2)
+        return f"{prefix}Paragraph {para_num}: [____]"
+
+    # Match "Paragraph X: [single letter A-F]" that's not followed by more text
+    # This catches both plain text and box drawing formats
+    pattern = r'(│\s*)?Paragraph\s+(\d+):\s*([A-F])(?:\s*│|\s*$|\s*\n)'
+
+    def full_replace(match):
+        prefix = match.group(1) if match.group(1) else ""
+        para_num = match.group(2)
+        suffix = "│" if match.group(0).rstrip().endswith("│") else ""
+        if suffix:
+            return f"{prefix}Paragraph {para_num}: [____]                     {suffix}\n"
+        return f"{prefix}Paragraph {para_num}: [____]\n"
+
+    content = re.sub(pattern, full_replace, content, flags=re.IGNORECASE)
+
+    # Also remove any "ANSWER KEY" sections that might have slipped through without markers
+    answer_key_section_pattern = r'\n*(?:ANSWER KEY|Answer Key).*?(?=\n\n[A-Z]|\n\n\*\*|\Z)'
+    content = re.sub(answer_key_section_pattern, '', content, flags=re.DOTALL | re.IGNORECASE)
+
+    return content
+
+
+def _validate_content(content: str, paper_format: str, section: Optional[str]) -> Tuple[bool, List[str]]:
+    """Validate generated content against rules. Returns (is_valid, list_of_issues)."""
+    import re
+
+    issues = []
+
+    if section:
+        key = f"{paper_format}_{section}"
+    else:
+        # For full paper, validate each section
+        return True, []  # Skip validation for full papers (validated per-section)
+
+    rules = VALIDATION_RULES.get(key, {})
+    if not rules:
+        return True, []
+
+    # Check word count
+    word_count = len(content.split())
+    if "min_words" in rules and word_count < rules["min_words"]:
+        issues.append(f"Content too short: {word_count} words (min: {rules['min_words']})")
+    if "max_words" in rules and word_count > rules["max_words"]:
+        issues.append(f"Content too long: {word_count} words (max: {rules['max_words']})")
+
+    # Check line count (for editing section)
+    if "min_lines" in rules:
+        numbered_lines = len(re.findall(r"^\d+\.\s", content, re.MULTILINE))
+        if numbered_lines < rules["min_lines"]:
+            issues.append(f"Too few numbered lines: {numbered_lines} (min: {rules['min_lines']})")
+
+    # Check required patterns
+    for pattern in rules.get("required_patterns", []):
+        if not re.search(pattern, content, re.IGNORECASE):
+            issues.append(f"Missing required pattern: {pattern}")
+
+    # Check forbidden patterns
+    for pattern in rules.get("forbidden_patterns", []):
+        if re.search(pattern, content, re.IGNORECASE):
+            issues.append(f"Found forbidden pattern: {pattern}")
+
+    # Check question count
+    if "min_questions" in rules:
+        # Count question numbers like Q1, Q2, 1., 2., (a), (b)
+        question_count = len(re.findall(r"(?:^|\n)\s*(?:Q?\d+[\.\):]|\(\w\))", content))
+        if question_count < rules["min_questions"]:
+            issues.append(f"Too few questions: {question_count} (min: {rules['min_questions']})")
+
+    # Check prompt count (for Section C)
+    if "min_prompts" in rules:
+        prompt_count = len(re.findall(r"(?:^|\n)\s*\d+\.\s+(?:Write|Describe|'|\")", content))
+        if prompt_count < rules["min_prompts"]:
+            issues.append(f"Too few prompts: {prompt_count} (min: {rules['min_prompts']})")
+
+    is_valid = len(issues) == 0
+    return is_valid, issues
+
+
+def _check_common_llm_issues(content: str) -> List[str]:
+    """Check for common LLM generation issues."""
+    import re
+
+    issues = []
+
+    # Check for non-English content (common issue)
+    non_ascii_ratio = sum(1 for c in content if ord(c) > 127) / max(len(content), 1)
+    if non_ascii_ratio > 0.1:  # More than 10% non-ASCII
+        issues.append("High ratio of non-ASCII characters (possible non-English content)")
+
+    # Check for repetitive content
+    words = content.lower().split()
+    if len(words) > 50:
+        # Check for repeated phrases (3+ word sequences)
+        phrases = [" ".join(words[i:i+3]) for i in range(len(words)-2)]
+        phrase_counts = {}
+        for phrase in phrases:
+            phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
+        max_repeat = max(phrase_counts.values()) if phrase_counts else 0
+        if max_repeat > 5:
+            issues.append(f"Repetitive content detected (phrase repeated {max_repeat} times)")
+
+    # Check for placeholder text
+    placeholders = re.findall(r"\[(?:DATE|TIME|NAME|LOCATION|INSERT|TODO|TBD|XXX)\]", content, re.IGNORECASE)
+    if placeholders:
+        issues.append(f"Placeholder text found: {placeholders[:3]}")
+
+    # Check for incomplete sentences at end
+    content_stripped = content.strip()
+    if content_stripped and content_stripped[-1] not in ".!?\"')\n":
+        if len(content_stripped) > 100:  # Only flag for substantial content
+            issues.append("Content may be truncated (doesn't end with proper punctuation)")
+
+    return issues
 
 
 def _build_prompt(
@@ -117,31 +428,139 @@ def _official_structure_guidance(paper_format: str, section: Optional[str]) -> s
             ),
             "section_a": dedent(
                 """\
-                Generate Paper 1 Section A [10 marks] (Editing), SINGLE SECTION ONLY:
+                Generate Paper 1 Section A [10 marks] (Editing), SINGLE SECTION ONLY.
+
+                *** YOU MUST CREATE EXACTLY 8 GRAMMATICALLY WRONG SENTENCES ***
+
+                FIXED ERROR PLACEMENT - FOLLOW THIS EXACTLY:
+                - Line 1: CORRECT (no error)
+                - Line 2: MUST HAVE ERROR
+                - Line 3: MUST HAVE ERROR  
+                - Line 4: CORRECT (no error)
+                - Line 5: MUST HAVE ERROR
+                - Line 6: MUST HAVE ERROR
+                - Line 7: MUST HAVE ERROR
+                - Line 8: CORRECT (no error)
+                - Line 9: MUST HAVE ERROR
+                - Line 10: MUST HAVE ERROR
+                - Line 11: MUST HAVE ERROR
+                - Line 12: CORRECT (no error)
+
+                Total: 8 error lines (2,3,5,6,7,9,10,11) + 4 correct lines (1,4,8,12)
+
+                ---
+
+                OUTPUT FORMAT:
+
+                **Section A [10 marks]**
+
+                The following passage contains some errors. Each of the 12 lines may contain one error. If there is an error, write the correction in the space provided. If the line is correct, put a tick (✓).
+
+                1. [CORRECT sentence - no errors]
+                2. [Sentence with ONE clear grammatical error]
+                3. [Sentence with ONE clear grammatical error]
+                4. [CORRECT sentence - no errors]
+                5. [Sentence with ONE clear grammatical error]
+                6. [Sentence with ONE clear grammatical error]
+                7. [Sentence with ONE clear grammatical error]
+                8. [CORRECT sentence - no errors]
+                9. [Sentence with ONE clear grammatical error]
+                10. [Sentence with ONE clear grammatical error]
+                11. [Sentence with ONE clear grammatical error]
+                12. [CORRECT sentence - no errors]
+
+                ===ERROR_KEY_START===
+                Line 2: "[wrong]" should be "[correct]" (error type)
+                Line 3: "[wrong]" should be "[correct]" (error type)
+                Line 5: "[wrong]" should be "[correct]" (error type)
+                Line 6: "[wrong]" should be "[correct]" (error type)
+                Line 7: "[wrong]" should be "[correct]" (error type)
+                Line 9: "[wrong]" should be "[correct]" (error type)
+                Line 10: "[wrong]" should be "[correct]" (error type)
+                Line 11: "[wrong]" should be "[correct]" (error type)
+                Correct lines: 1, 4, 8, 12
+                ===ERROR_KEY_END===
+
+                ---
+
+                *** USE THESE 8 ERROR TYPES - ONE PER ERROR LINE ***
                 
-                PASSAGE FORMAT:
-                - Output ONE passage formatted into exactly 12 lines, each line prefixed "1. ", "2. ", ..., "12. ".
-                - CRITICAL: The passage MUST be CONTINUOUS PROSE—a single flowing paragraph that has been divided into numbered lines for editing purposes. 
-                - Each line should flow naturally into the next, NOT be a standalone sentence. The text should read as one coherent narrative/description when the line numbers are removed.
-                - WRONG: "1. The weather was nice. 2. I went to the park. 3. Birds were singing." (disconnected sentences)
-                - CORRECT: "1. The weather was particularly pleasant that morning, with a gentle breeze 2. carrying the scent of freshly cut grass across the park where I had 3. decided to spend my afternoon reading under the old oak tree that..." (continuous flow)
-                
-                ERROR PLACEMENT:
-                - Lines 1 and 12 must remain error-free; NEVER insert errors into those two lines.
-                - Among lines 2–11, plant EXACTLY EIGHT single-word or single-phrase errors (grammar, vocabulary, spelling, or punctuation) and leave EXACTLY TWO of those lines completely correct.
-                - Distribute the 8 errors unpredictably across lines 2–11 (not consecutive).
-                - Do NOT highlight, flag, or hint where the errors are.
-                
-                ANSWER SPACES (DO NOT INCLUDE IN OUTPUT):
-                - Do NOT include "Answer Spaces:" or any blank lines for answers. The HTML template will automatically generate the answer column on the right side of the passage.
-                
-                VALIDATION CHECKLIST (verify before returning):
-                ✓ Exactly 12 numbered lines
-                ✓ Continuous prose that flows naturally across all lines
-                ✓ Lines 1 and 12 are error-free
-                ✓ Exactly 8 errors distributed across lines 2–11
-                ✓ Exactly 2 clean lines among lines 2–11
-                ✓ No answer spaces or hints included
+                *** IMPORTANT: Per official syllabus, ONLY GRAMMATICAL errors are tested ***
+                *** Do NOT include spelling or punctuation errors ***
+
+                Line 2 ERROR - Subject-verb (plural subject needs plural verb):
+                   WRONG: "The students was excited" or "Many people was happy"
+                   CORRECT: were
+                   
+                Line 3 ERROR - Subject-verb (singular subject needs singular verb):
+                   WRONG: "The teacher have planned" or "She have finished"
+                   CORRECT: has
+                   
+                Line 5 ERROR - Wrong tense (past event needs past tense):
+                   WRONG: "Yesterday I walk to school" or "Last week he go there"
+                   CORRECT: walked, went
+                   
+                Line 6 ERROR - Subject-verb (third person singular needs -s):
+                   WRONG: "The system allow users" or "This method provide benefits"
+                   CORRECT: allows, provides
+                   
+                Line 7 ERROR - Wrong adverb form (adverb needed, not adjective):
+                   WRONG: "She spoke very soft" or "He ran very quick"
+                   CORRECT: softly, quickly
+                   
+                Line 9 ERROR - Wrong participle form (passive needs past participle):
+                   WRONG: "should be encourage" or "must be complete"
+                   CORRECT: encouraged, completed
+                   
+                Line 10 ERROR - Wrong word form (noun/adjective confusion):
+                   WRONG: "It was a beauty day" or "The success of the plan"
+                   CORRECT: beautiful, successful (when adjective needed)
+                   
+                Line 11 ERROR - Wrong pronoun or determiner:
+                   WRONG: "Me and him went" or "Everyone brought their own"
+                   CORRECT: "He and I went", "Everyone brought his or her own"
+
+                ---
+
+                *** COMPLETE EXAMPLE - COPY THIS STRUCTURE EXACTLY ***
+
+                **Section A [10 marks]**
+
+                The following passage contains some errors. Each of the 12 lines may contain one error. If there is an error, write the correction in the space provided. If the line is correct, put a tick (✓).
+
+                1. The annual sports day at Riverside School was a memorable event for everyone.
+                2. All the students was excited to participate in the various competitions.
+                3. The head teacher have been planning this event since the beginning of term.
+                4. Parents and teachers gathered early to find good seats near the field.
+                5. The first race begin at nine o'clock sharp with the youngest students.
+                6. This event bring together families from all parts of the community.
+                7. The athletes ran very quick around the track in the final race.
+                8. Many photographs were taken to capture the special moments of the day.
+                9. The winning team was suppose to receive their medals at the ceremony.
+                10. It was a beauty day and everyone enjoyed the warm sunshine.
+                11. Me and my friends cheered loudly for all the participants.
+                12. Students and parents left the school feeling proud and happy that evening.
+
+                ===ERROR_KEY_START===
+                Line 2: "was" should be "were" (subject-verb agreement with plural "students")
+                Line 3: "have" should be "has" (subject-verb agreement with singular "teacher")
+                Line 5: "begin" should be "began" (past tense required)
+                Line 6: "bring" should be "brings" (third person singular needs -s)
+                Line 7: "quick" should be "quickly" (adverb needed after verb)
+                Line 9: "suppose" should be "supposed" (past participle needed)
+                Line 10: "beauty" should be "beautiful" (adjective needed, not noun)
+                Line 11: "Me" should be "My friends and I" (correct pronoun form)
+                Correct lines: 1, 4, 8, 12
+                ===ERROR_KEY_END===
+
+                ---
+
+                NOW CREATE A NEW 12-LINE PASSAGE:
+                - Use a DIFFERENT topic (not sports day)
+                - ERRORS MUST be in lines: 2, 3, 5, 6, 7, 9, 10, 11
+                - CORRECT lines: 1, 4, 8, 12
+                - Each error must be OBVIOUSLY grammatically wrong
+                - Use the 8 error types listed above
                 """
             ),
             "section_b": dedent(
@@ -149,25 +568,36 @@ def _official_structure_guidance(paper_format: str, section: Optional[str]) -> s
                 Generate Paper 1 Section B [30 marks] (Situational Writing), SINGLE SECTION ONLY:
                 - DO NOT include headers, footers, or paper metadata (MINISTRY OF EDUCATION, candidate info, etc.). Generate ONLY the Section B content.
                 - Start directly with "**Section B [30 marks]**" or "Section B [30 marks]".
-                
+
+                O-LEVEL SYLLABUS ALIGNMENT:
+                - Tasks MUST be appropriate for 15-17 year old students taking GCE O-Level English
+                - APPROPRIATE TOPICS: community events, educational programs, environmental initiatives, health campaigns, youth activities, cultural events, library/museum programs, volunteer opportunities, sports programs, school-related activities
+                - AVOID TOPICS: visa/immigration, work permits, adult financial services, complex legal matters, topics beyond student experience
+
                 VISUAL STIMULUS INTEGRATION:
                 - If a visual stimulus is provided, you MUST acknowledge it in your task instructions. Begin with a statement like "You have come across a visually appealing webpage/poster/advertisement..." or "Refer to the visual stimulus provided..." or "Using the visual stimulus shown above..." to explicitly reference the image.
                 - The visual should present COMPELLING, PERSUASIVE content that gives students clear reasons to choose between options or take action.
-                - If the visual shows multiple options (e.g., courses, products, destinations), ensure the visual description includes DIFFERENTIATING FACTORS that help students make informed comparisons (e.g., price differences, unique benefits, target audiences, special features).
-                
+                - If the visual shows multiple options (e.g., courses, programs, destinations), ensure the task requires students to make informed comparisons.
+                - If the visual contains ANY immigration, visa, or work permit related content, IGNORE those elements entirely and focus only on the community/educational aspects.
+
                 TASK DESIGN:
                 - Choose ONE appropriate task type (letter, email, report, or speech) consistent with the visual stimulus topic.
-                - You MUST base the task on the provided visual description; reflect its headings/callouts/blurbs. Do NOT invent unrelated school or funding contexts unless topics explicitly suggest school.
-                
+                - You MUST base the task on the provided visual description; reflect its headings/callouts/blurbs.
+                - Ensure the scenario is relatable and achievable for a secondary school student.
+
                 PAC (Purpose, Audience, Context) - IMPLICIT INTEGRATION:
                 - DO NOT use explicit "Purpose:", "Audience:", "Context:" labels.
                 - Instead, WEAVE the PAC elements naturally into the situational scenario. The purpose, audience, and context should be CLEAR from the narrative setup without being labeled.
                 - WRONG: "Purpose: To persuade your friend. Audience: A close friend. Context: You saw an advertisement."
                 - CORRECT: "Your close friend has been looking for a photography course to develop their hobby. You recently came across this advertisement and believe one of the courses would be perfect for them. Write an email to persuade them to sign up, explaining why you think it suits their interests and skill level."
-                
+
                 KEY POINTS & GUIDANCE:
                 - List 3–5 key points students must address that directly tie to the visual description.
-                - State tone/register explicitly (e.g., "Use an informal but enthusiastic tone").
+                - State tone/register explicitly based on the audience:
+                  • FORMAL tone: For principal, teachers, official school bodies, external organisations
+                  • SEMI-FORMAL tone: For school newsletter, club members, community groups
+                  • INFORMAL tone: For friends, peers, family members
+                - Example: "Use a formal and enthusiastic tone" (for writing to principal)
                 - Advise 250–350 words.
                 - Avoid placeholders like [Date]/[Time]/[Location]; if not essential, omit them.
                 - End with "---" or "[End of Section B]" marker.
@@ -212,17 +642,18 @@ def _official_structure_guidance(paper_format: str, section: Optional[str]) -> s
                   Set EXACTLY 4 questions where ONE has two subparts (e.g., Q1(a), Q1(b)) so the total marks is 5.
                   Typical mix: Q1(a) Literal, Q1(b) Literal, Q2 Persuasive technique, Q3 Language effect (phrased as "How does X persuade/influence the reader..."), Q4 Inference.
                   Questions must explicitly reference elements of the described visual text.
-                - Section B [20 marks] (Reading Comprehension Open-Ended):
-                  Supply ONE nonfiction passage of about 600–650 words (coherent, contemporary topic), with paragraph numbers and LINE NUMBERS.
-                  Prefix each line with a line number marker like "[1]", "[2]", ..., ensuring numbers increment correctly throughout the passage.
-                  Set ~10–14 question parts (including sub-items) covering literal retrieval, inference, vocabulary-in-context,
-                  writer's craft (phrased as "How does X persuade/influence the reader..."), and evaluation. Ensure at least ONE vocabulary-in-context item.
-                  The FINAL question (Q10) MUST be a 4-mark flowchart with: paragraph-based labels (not Step 1-4), 6 options provided, and students choose 4 correct answers.
-                - Section C [25 marks] (Guided Comprehension + Summary):
-                  Provide a SECOND passage (different from Section B), around 400–550 words, with paragraph numbers and LINE NUMBERS.
+                - Section B [20 marks] (Reading Comprehension Open-Ended - NARRATIVE):
+                  *** Per official syllabus: "Text 3 which is narrative in nature" ***
+                  Supply ONE NARRATIVE passage (story/recount) of about 600–650 words with characters, setting, plot, and resolution.
+                  Include paragraph numbers. Set ~6 questions (Q5-Q10) covering literal retrieval, vocabulary-in-context,
+                  writer's craft for narrative (tension, mood, character portrayal), and evaluation.
+                  The FINAL question (Q10) MUST be a 4-mark SEQUENCE flowchart showing story events in order (not themes).
+                - Section C [25 marks] (Guided Comprehension + Summary - NON-NARRATIVE):
+                  *** Per official syllabus: "Text 4, which is non-narrative in nature" ***
+                  Provide a NON-NARRATIVE passage (expository/argumentative/informational) around 400–550 words.
                   Before the summary, set 4–5 questions totaling 10 marks (short-answer mix relevant to the new passage).
-                  Then set a 15-mark summary task with a clearly specified focus and paragraph range; require continuous writing (≤80 words),
-                  using own words as far as possible (not note form).
+                  Then set a 15-mark summary task covering a SUBSET of body paragraphs (e.g., Paragraphs 2-5, not the full text);
+                  require continuous writing (≤80 words), using own words as far as possible (not note form).
                 """
             ),
             "section_a": dedent(
@@ -230,14 +661,59 @@ def _official_structure_guidance(paper_format: str, section: Optional[str]) -> s
                 Generate Paper 2 Section A [5 marks] (Visual Text Comprehension), SINGLE SECTION ONLY:
                 - DO NOT include headers, footers, or paper metadata (MINISTRY OF EDUCATION, candidate info, etc.). Generate ONLY the Section A content.
                 - Start directly with "**Section A [5 marks]**" or "Section A [5 marks]".
-                - A visual stimulus image will be embedded in the paper. Begin your section by acknowledging it: "Refer to the visual stimulus provided above" or "Study the visual stimulus shown" or similar.
-                - If a visual description is provided, use it to understand what the visual contains, but do NOT copy the description verbatim. Instead, write questions that reference specific elements that will be visible in the image.
-                - Provide EXACTLY 4 questions where ONE has two subparts (e.g., Q1(a), Q1(b)) so the total marks is 5.
-                - Q1(a) and Q1(b) must be literal retrieval questions requiring direct lifting of short phrases/words from the visual (no inference or opinion).
-                - Q2 must analyse a specific persuasive element (e.g., the banner headline, a callout bubble, imagery, promises, emotional appeal) and require the student to name/explain the technique tied to that element.
-                - Q3 must be a language effect question on a quoted word/phrase from the visual (e.g., "Explain the effect of the phrase '...')."
-                - Q4 should be an inference question that still points back to explicit evidence in the visual.
-                - Questions must refer directly to concrete elements of the visual stimulus (callouts, imagery, benefits, promises, emotional appeal, etc.).
+
+                O-LEVEL SYLLABUS ALIGNMENT:
+                - Questions MUST be appropriate for 15-17 year old students taking GCE O-Level English
+                - Focus on VISUAL TEXT COMPREHENSION skills: identifying information, understanding persuasive techniques, analysing language effects
+                - AVOID questions about: visa/immigration, work permits, adult financial services, complex legal matters
+
+                VISUAL STIMULUS REQUIREMENTS:
+                - Include a DETAILED DESCRIPTION of the visual stimulus with:
+                  • Clear headline/title
+                  • At least 3-5 specific program names, event names, or feature names (these become answers for Q1)
+                  • At least 2-3 persuasive phrases or slogans (for Q2 and Q3)
+                  • Statistics, dates, or factual details
+                  • Call-to-action phrases
+                  • Organization name and tagline
+                - The visual must have ENOUGH DETAIL for all questions to be answerable
+
+                VISUAL STIMULUS INTEGRATION:
+                - Begin with: "Refer to the visual stimulus provided above and answer Questions 1-4."
+                - Write questions that reference SPECIFIC elements visible in the visual.
+
+                QUESTION REQUIREMENTS - CRITICAL:
+                
+                Q1(a) and Q1(b) - DIRECT RETRIEVAL [1 mark each]:
+                - These MUST require students to COPY EXACT PHRASES/WORDS from the visual
+                - The answer must be a direct quote, NOT a paraphrase
+                - Be SPECIFIC in your question about what aspect you're asking about
+                - WRONG: "What does the visual state about the nature of meetings?" (too vague)
+                - CORRECT: "What does the visual state about the frequency and structure of meetings held by the network?"
+                - CORRECT: "Identify the phrase that describes..." or "What is the name of..." or "State the exact phrase that..."
+                - Answer must be DIRECTLY LIFTABLE from the visual text
+                
+                Q2 - PERSUASIVE TECHNIQUE [1 mark]:
+                - Quote an EXACT phrase from the visual and ask about its persuasive effect
+                - CORRECT: "Explain how the phrase '[exact quote]' serves as a persuasive technique."
+                - The quoted phrase MUST appear word-for-word in the visual description
+                
+                Q3 - LANGUAGE EFFECT [1 mark]:
+                - Quote an EXACT phrase and ask about its effect on the reader
+                - CORRECT: "Explain the effect of the phrase '[exact quote]' on the reader."
+                - The quoted phrase MUST appear word-for-word in the visual description
+                
+                Q4 - INFERENCE [1 mark]:
+                - Ask what can be inferred, requiring textual evidence
+                - CORRECT: "Based on the information in the visual, what can you infer about X? Provide evidence from the visual to support your answer."
+
+                VALIDATION CHECKLIST:
+                □ Visual description has at least 3 specific names/terms for Q1 answers
+                □ Visual description has at least 2 quotable persuasive phrases for Q2/Q3
+                □ Q1(a) answer is an EXACT phrase from the visual
+                □ Q1(b) answer is an EXACT phrase from the visual
+                □ Q2 quotes an EXACT phrase that EXISTS in the visual
+                □ Q3 quotes an EXACT phrase that EXISTS in the visual
+                □ Q4 can be answered with evidence from the visual
                 """
             ),
             "section_b": dedent(
@@ -245,46 +721,97 @@ def _official_structure_guidance(paper_format: str, section: Optional[str]) -> s
                 Generate Paper 2 Section B [20 marks] (Reading Comprehension Open-Ended), SINGLE SECTION ONLY:
                 - DO NOT include headers, footers, or paper metadata (MINISTRY OF EDUCATION, candidate info, etc.). Generate ONLY the Section B content.
                 - Start directly with "**Section B [20 marks]**" or "Section B [20 marks]".
-                - Provide ONE nonfiction passage (~600–650 words) with clear paragraph numbering and LINE NUMBERS.
-                - Prefix each line with a line number marker like "[1]", "[2]", ..., ensuring numbers increment correctly throughout the passage.
-                - Set ~10–14 question parts (including sub-items) whose marks sum to EXACTLY 20. Clearly state the mark allocation for every part.
                 
-                REQUIRED QUESTION TYPES:
-                  • Literal retrieval: 2–3 questions (direct lifting, short answers).
-                  • Inferential: 2 questions.
-                  • Vocabulary-in-context: 1–2 questions (at least one "Give one word/phrase..." style).
-                  • Writer's craft / Language effect: 1 question analysing technique/effect.
-                    - PHRASING: Use "How does [quoted phrase/technique] persuade the reader..." or "How does the writer influence the reader by using..." or "How does [X] affect the reader's perception of..."
-                    - WRONG: "Explain the effect of the phrase '...'"
-                    - CORRECT: "How does the phrase '...' persuade the reader to feel sympathy for the character?"
-                    - CORRECT: "How does the writer's use of [technique] influence the reader's understanding of...?"
-                  • Evaluative: 1–2 questions requiring judgement with textual evidence.
-                  • Higher-order opinion/interpretation: 1 question inviting personal response linked to the passage.
+                *** OFFICIAL SYLLABUS REQUIREMENT: Text 3 MUST be NARRATIVE in nature ***
                 
-                FINAL QUESTION - FLOWCHART (MUST be Q10, worth 4 marks):
-                  • This MUST be the last question and presented as a flowchart/sequence task.
-                  • Reference SPECIFIC PARAGRAPH RANGES (e.g., "Based on Paragraphs 2-3", "From Paragraphs 4-6").
-                  • DO NOT use "Step 1, Step 2, Step 3, Step 4" format.
-                  • USE paragraph-based labels like: "Paragraph 1-2:", "Paragraph 3-4:", "Paragraph 5:", "Paragraph 6-7:"
-                  • Provide EXACTLY 6 OPTIONS for students to choose from, where only 4 are correct answers.
-                  • Format example:
-                    "10. Based on Paragraphs 2-6, complete the flowchart below by choosing FOUR correct answers from the six options provided. [4 marks]
-                    
-                    Options:
-                    A. [statement about content from passage]
-                    B. [statement about content from passage]
-                    C. [statement about content from passage]
-                    D. [statement about content from passage]
-                    E. [statement about content from passage]
-                    F. [statement about content from passage]
-                    
-                    Flowchart:
-                    Paragraph 2-3: ______
-                    Paragraph 4: ______
-                    Paragraph 5: ______
-                    Paragraph 6: ______"
-                  
-                - Reference paragraph or line numbers in the questions where helpful.
+                PASSAGE TYPE - NARRATIVE (Story or Recount):
+                - Generate a NARRATIVE passage (~600–650 words) - this is a STORY or personal RECOUNT
+                - The passage should have characters, settings, events, and/or conflict
+                - Examples: A personal experience, a short story, an adventure, a memoir excerpt, a biographical recount
+                - NOT an expository essay, NOT an argumentative text, NOT an informational article
+                - Include clear PARAGRAPH numbering (Paragraph 1, 2, 3, etc.)
+                
+                NARRATIVE ELEMENTS TO INCLUDE:
+                - Setting: Where and when the story takes place
+                - Character(s): At least one main character with some development
+                - Plot: A clear sequence of events with beginning, middle, end
+                - Conflict or challenge: Something the character(s) must face
+                - Resolution: How things turn out
+                - Descriptive language: Sensory details, imagery, figurative language
+                
+                QUESTION NUMBERING - CRITICAL:
+                - Section A has Questions 1-4 (visual text)
+                - Section B MUST start at Question 5 and continue: 5, 6, 7, 8, 9, 10
+                - DO NOT restart numbering at 1
+
+                REQUIRED QUESTION TYPES FOR NARRATIVE (Q5-Q10):
+                
+                Q5-Q6: Literal retrieval about the narrative (2 questions, 2 marks each)
+                  - "Based on Paragraph X, what TWO things did the narrator notice when...?"
+                  - "According to the passage, why did [character] decide to...?"
+                  - "What happened after [event]?"
+                  - "State two feelings the narrator experienced during..."
+                
+                Q7: Vocabulary-in-context (1 mark)
+                  - "Give one word from Paragraph X that suggests [feeling/atmosphere/action]..."
+                  - "What word in the passage conveys [meaning]...?"
+                
+                Q8: Writer's craft / Language effect (2 marks)
+                  - NARRATIVE-FOCUSED PHRASING:
+                  - "How does the writer create tension/suspense in Paragraph X?"
+                  - "How does the phrase '[exact quote]' contribute to the mood of the passage?"
+                  - "What is the effect of the writer's description of [scene/character]?"
+                  - "How does the writer convey the character's emotions through [technique]?"
+                
+                Q9: Evaluative/Opinion about the narrative (2-3 marks)
+                  - "What do you think the narrator learned from this experience? Explain with evidence."
+                  - "Do you think [character's decision] was the right choice? Explain your view."
+                  - "What does this story suggest about [theme]?"
+                
+                Q10: Sequence Flowchart (4 marks) - STORY SEQUENCE, not themes
+                  - For NARRATIVE passages, the flowchart shows the SEQUENCE OF EVENTS
+                  - Structure: What happened first → What happened next → Then → Finally
+                  - Provide 6 options, students choose 4 that show correct order of events
+
+                FINAL QUESTION - SEQUENCE FLOWCHART (Q10, worth 4 marks):
+
+                *** FOR NARRATIVE: Track the SEQUENCE OF EVENTS across paragraphs ***
+
+                FLOWCHART DESIGN FOR NARRATIVE:
+                
+                The flowchart should trace the story's plot sequence:
+                - Box 1: Event/situation from Paragraph 1-2 (beginning)
+                - Box 2: Event/development from Paragraph 2-3 (rising action)
+                - Box 3: Event/climax from Paragraph 3-4 (middle/turning point)
+                - Box 4: Event/resolution from Paragraph 4-5 (end)
+                
+                FLOWCHART OPTIONS - Create 6 event descriptions:
+                - 4 CORRECT options: Each summarizes a key event from a specific part of the story
+                - 2 DISTRACTOR options: Events that did NOT happen or happen in wrong order
+                
+                EXAMPLE FOR NARRATIVE:
+
+                Story about a student's first day at a new school:
+                - Para 1-2: Nervous arrival, looking at unfamiliar faces
+                - Para 2-3: First class, struggles to find the classroom
+                - Para 3-4: Makes an unexpected friend during lunch
+                - Para 4-5: Realizes the new school might not be so bad
+
+                Options (showing story sequence):
+                A. The narrator felt anxious while entering the school gates (→ Beginning)
+                B. The narrator immediately felt welcomed by everyone (DISTRACTOR - not what happened)
+                C. The narrator got lost trying to find the first classroom (→ Rising action)
+                D. A classmate invited the narrator to sit together at lunch (→ Middle)
+                E. The narrator decided to transfer to another school (DISTRACTOR - not what happened)
+                F. The narrator felt hopeful about the days ahead (→ Resolution)
+
+                ===FLOWCHART_ANSWER_KEY_START===
+                Box 1 (Beginning): A (reason: describes initial nervousness in Para 1-2)
+                Box 2 (Rising action): C (reason: describes getting lost in Para 2-3)
+                Box 3 (Middle): D (reason: describes making friend in Para 3-4)
+                Box 4 (Resolution): F (reason: describes final positive outlook in Para 4-5)
+                Distractors: B, E (B: contradicts initial feelings; E: not stated in passage)
+                ===FLOWCHART_ANSWER_KEY_END===
                 """
             ),
             "section_c": dedent(
@@ -292,17 +819,250 @@ def _official_structure_guidance(paper_format: str, section: Optional[str]) -> s
                 Generate Paper 2 Section C [25 marks] (Guided Comprehension + Summary), SINGLE SECTION ONLY:
                 - DO NOT include headers, footers, or paper metadata (MINISTRY OF EDUCATION, candidate info, etc.). Generate ONLY the Section C content.
                 - Start directly with "**Section C [25 marks]**" or "Section C [25 marks]".
-                - Provide a NEW nonfiction passage (~550–650 words), distinct from Section B, with paragraph numbers and LINE NUMBERS. Do NOT reuse Section B's passage or theme.
-                - Set 4–5 short-answer questions totaling 10 marks. Include at least one inference question but avoid vocabulary-in-context and writer's effect/intention items for this section. Keep the difficulty comparable to Cambridge Paper 2 Section C.
-                - Then set a 15-mark summary task with a clearly specified focus and paragraph range; require continuous writing (≤80 words) using candidates' own words as far as possible. Indicate that about 10 key points should be drawn from the passage.
-                - Ensure total marks are exactly 25 (10 for questions + 15 for summary), and do not add extraneous headings.
+                
+                *** OFFICIAL SYLLABUS REQUIREMENT: Text 4 MUST be NON-NARRATIVE in nature ***
+                
+                - Provide a NON-NARRATIVE passage (~550–650 words) with paragraph numbers
+                - NON-NARRATIVE means: expository, argumentative, informational, explanatory, persuasive
+                - NOT a story, NOT a personal recount, NOT fiction
+                - Section B is NARRATIVE (story), so Section C must be NON-NARRATIVE (factual/informational)
+                - Do NOT reuse Section B's theme
+
+                QUESTION NUMBERING - CRITICAL:
+                - Section C continues from Section B (which ends at Q10)
+                - Section C questions are: Q11, Q12, Q13, Q14 (comprehension) and Q15 (summary)
+                - Do NOT restart at Q1
+
+                COMPREHENSION QUESTIONS (Q11-Q14, 10 marks total):
+                
+                ALLOWED QUESTION TYPES:
+                1. Literal Retrieval [1-2 marks]
+                   - "What are two benefits of...?" 
+                   - "According to Paragraph X, what/why/how...?"
+                   - "State one reason..."
+
+                2. Explanation/Reasoning [2 marks]
+                   - "How does the writer show that X is important in Paragraph Y?"
+                   - "Explain how X contributes to Y according to the passage."
+                   - CLEAR PHRASING - avoid vague "influence" questions
+
+                3. Vocabulary-in-Context [1 mark]
+                   - "Give one word from Paragraph X that means '...'."
+
+                4. Cause-Effect [2 marks]
+                   - "What effect does X have on Y?"
+
+                DO NOT INCLUDE:
+                ✗ "Based on your own knowledge..."
+                ✗ "Do you agree...? Justify with your own views"
+                ✗ Open-ended evaluative questions
+                ✗ Writer's tone/attitude analysis
+
+                SUMMARY TASK (Q15, 15 marks):
+                
+                PASSAGE DESIGN FOR SUMMARY:
+                - The summary paragraphs MUST contain AT LEAST 10 DISTINCT summarisable points
+                - Each point should be a separate fact, benefit, feature, or idea
+                - Points should be clearly identifiable (not buried in complex sentences)
+
+                PARAGRAPH RANGE FOR SUMMARY:
+                - Use a SUBSET of paragraphs, NOT all paragraphs
+                - CORRECT: "Paragraphs 2-5" or "Paragraphs 2-4" (specific body paragraphs)
+                - AVOID: "Paragraphs 1-6" (too broad, includes intro and conclusion)
+                - The subset should contain the main content paragraphs with summarisable points
+                - Introduction (Para 1) and Conclusion (final para) typically excluded
+
+                FORMAT:
+                "15. Summary Task [15 marks]
+
+                Using your own words as far as possible, summarise [specific focus] as described in Paragraphs X-Y.
+
+                Your summary must be in continuous writing (not note form) and should not be longer than 80 words, including the 10 words given below to help you begin.
+
+                [Starting line with approximately 10 words]..."
+
+                EXAMPLE:
+                "Using your own words as far as possible, summarise the benefits of civic engagement as described in Paragraphs 2-5.
+                
+                Your summary must be in continuous writing (not note form) and should not be longer than 80 words, including the 10 words given below to help you begin.
+                
+                Civic engagement benefits communities and individuals in several ways..."
+
+                MARK BREAKDOWN (internal, not shown to students):
+                - Content: 8 marks (1 mark per key point, max 8)
+                - Language: 7 marks (paraphrasing quality, fluency, coherence)
+
+                - Ensure total marks are exactly 25 (10 for Q11-Q14 + 15 for Q15).
                 """
             ),
         },
         "oral": {
             None: dedent(
                 """\
-                Produce the three components of the Oral Communication paper: reading aloud passage, stimulus-based conversation prompt with background description, and general conversation follow-up themes.
+                Generate a complete GCE O-Level Oral Communication examination with ALL THREE components:
+
+                COMPONENT 1: READING ALOUD [10 marks]
+                - Provide ONE prose passage of 300-400 words
+                - Topic should be contemporary and engaging (technology, environment, social issues, culture)
+                - Include a mix of sentence structures: simple, compound, and complex
+                - Include dialogue or direct speech (1-2 instances)
+                - Include numbers, dates, or statistics that require clear articulation
+                - Include words with varied stress patterns and challenging pronunciations
+                - Mark the passage with suggested pause points using "/" for short pauses and "//" for longer pauses
+                - Note any challenging words in brackets with pronunciation guidance
+
+                COMPONENT 2: STIMULUS-BASED CONVERSATION (SBC) [20 marks]
+                - Provide a VISUAL STIMULUS description (poster, infographic, or advertisement)
+                - The visual should relate to a contemporary issue or topic
+                - Include key visual elements: headings, statistics, images described, callouts
+                - After the visual, provide 4 DISCUSSION PROMPTS:
+                  • Q1: Direct reference to stimulus content (literal/factual)
+                  • Q2: Personal opinion/experience related to stimulus theme
+                  • Q3: Broader implications/analysis of the issue
+                  • Q4: Hypothetical scenario or solution-based question
+                - Include examiner notes with potential follow-up probes
+
+                COMPONENT 3: GENERAL CONVERSATION [20 marks]
+                - Provide 5 CONVERSATION THEMES, each with:
+                  • Theme title (e.g., "Technology & Daily Life")
+                  • 3-4 guiding questions per theme
+                  • Questions should progress: factual → personal → analytical → evaluative
+                - Themes should cover diverse areas: personal, social, educational, global
+                - Include examiner guidance on follow-up questions
+
+                FORMAT REQUIREMENTS:
+                - Clear section headers for each component
+                - Timing guidance (Reading: 10 min prep, 2 min read; SBC: 10 min; Conversation: 10 min)
+                - Candidate instructions at the start of each section
+                """
+            ),
+            "reading_aloud": dedent(
+                """\
+                Generate ONLY the READING ALOUD component [10 marks] of the Oral Examination:
+
+                PASSAGE REQUIREMENTS:
+                - Length: 300-400 words of continuous prose
+                - Topic: Contemporary and relevant (technology, environment, health, social issues, culture, travel)
+                - Tone: Narrative, descriptive, or expository (NOT argumentative for reading aloud)
+
+                LINGUISTIC FEATURES TO INCLUDE:
+                - Variety of sentence lengths and structures
+                - 1-2 instances of direct speech or dialogue
+                - Numbers, dates, percentages, or statistics (e.g., "67 percent", "2.5 million", "1997")
+                - Proper nouns and place names requiring clear pronunciation
+                - Words with challenging stress patterns or pronunciations
+                - Emotive or descriptive vocabulary
+                - Connectives and transitional phrases
+
+                FORMAT:
+                - Start with "READING ALOUD [10 marks]" header
+                - Include timing: "Preparation time: 10 minutes | Reading time: Approximately 2 minutes"
+                - Title the passage appropriately
+                - Present the passage in clear paragraphs
+                - After the passage, include:
+                  • "Pronunciation Guide:" section with 3-5 challenging words and their phonetic hints
+                  • "Suggested Pause Points:" brief guidance on natural pausing
+
+                DIFFICULTY CALIBRATION:
+                - Foundational: Simpler vocabulary, shorter sentences, familiar topics
+                - Standard: Balanced complexity, varied structures, contemporary topics
+                - Advanced: Sophisticated vocabulary, complex structures, nuanced topics
+                """
+            ),
+            "sbc": dedent(
+                """\
+                Generate ONLY the STIMULUS-BASED CONVERSATION (SBC) component [20 marks]:
+
+                VISUAL STIMULUS REQUIREMENTS:
+                - Describe a visual stimulus in detail (poster, infographic, advertisement, or webpage)
+                - Topic: Contemporary issue relevant to students (social media, environment, education, health, technology)
+                - Include these elements in your description:
+                  • Main heading/title
+                  • Key statistics or facts (at least 2-3)
+                  • Visual elements (images, icons, graphics - describe what they show)
+                  • Callout boxes or highlighted information
+                  • Any slogans, taglines, or quotes
+                  • Organization/source attribution
+
+                DISCUSSION PROMPTS (4 questions):
+
+                Question 1 - Stimulus-Based (Factual):
+                - Direct reference to information in the visual
+                - E.g., "According to the infographic, what is the main cause of...?"
+                - Should be answerable from the stimulus content
+
+                Question 2 - Personal Response:
+                - Connects stimulus theme to candidate's experience/opinion
+                - E.g., "How do you personally feel about...?" or "In your experience, have you...?"
+
+                Question 3 - Analysis/Implications:
+                - Broader thinking about the issue
+                - E.g., "Why do you think this is becoming more common...?" or "What are the consequences of...?"
+
+                Question 4 - Hypothetical/Solution:
+                - Forward-thinking or problem-solving
+                - E.g., "If you were in charge of..., what would you do?" or "How might we address...?"
+
+                EXAMINER NOTES:
+                - Include 2-3 potential follow-up probes for each question
+                - Note areas to explore if candidate gives brief responses
+
+                FORMAT:
+                - Start with "STIMULUS-BASED CONVERSATION [20 marks]" header
+                - Include timing: "Discussion time: Approximately 10 minutes"
+                - Present visual stimulus description in a bordered/highlighted section
+                - Number questions clearly as Q1, Q2, Q3, Q4
+                """
+            ),
+            "conversation": dedent(
+                """\
+                Generate ONLY the GENERAL CONVERSATION component [20 marks]:
+
+                THEME REQUIREMENTS:
+                - Provide EXACTLY 5 conversation themes
+                - Themes should be diverse and age-appropriate for O-Level students (15-17 years)
+                - Each theme should allow for personal, analytical, and evaluative responses
+
+                SUGGESTED THEME CATEGORIES (choose 5):
+                1. Personal & Family: relationships, responsibilities, values
+                2. School & Education: learning, teachers, future plans
+                3. Friends & Social Life: friendships, peer pressure, socializing
+                4. Technology & Media: social media, gaming, digital life
+                5. Environment & Society: sustainability, community, social issues
+                6. Health & Lifestyle: wellbeing, sports, habits
+                7. Culture & Traditions: festivals, customs, identity
+                8. Future & Aspirations: career, goals, dreams
+                9. Travel & Experiences: places, adventures, memories
+                10. Current Affairs: news, global issues, local matters
+
+                FOR EACH THEME, PROVIDE:
+
+                Theme Title: [Clear, engaging title]
+
+                Questions (3-4 per theme, progressing in complexity):
+                1. Factual/Personal: Simple question about candidate's experience
+                   E.g., "Tell me about your family" or "What do you enjoy doing in your free time?"
+
+                2. Descriptive/Explanatory: Requires more detail
+                   E.g., "Describe a memorable experience..." or "Explain why you feel..."
+
+                3. Analytical: Requires reasoning or comparison
+                   E.g., "Why do you think young people...?" or "How has this changed over time?"
+
+                4. Evaluative/Hypothetical: Requires judgement or speculation
+                   E.g., "What would you do if...?" or "Do you think this is a good development?"
+
+                EXAMINER GUIDANCE:
+                - For each theme, include 2-3 follow-up prompts
+                - Note how to encourage elaboration if responses are brief
+                - Suggest areas to probe for more depth
+
+                FORMAT:
+                - Start with "GENERAL CONVERSATION [20 marks]" header
+                - Include timing: "Conversation time: Approximately 10 minutes"
+                - Use "THEME 1:", "THEME 2:", etc. as headers
+                - Number questions within each theme
+                - Place examiner notes in italics or brackets
                 """
             ),
         },
@@ -619,18 +1379,22 @@ def generate_paper(
     client: Optional[OpenAI] = None,
     visual_mode: str = "embed",
     search_provider: str = "hybrid",
+    user_id: Optional[str] = None,
+    generate_answer_key_flag: bool = False,
 ) -> PaperGenerationResult:
     """Generate a synthetic exam paper using the configured LLM."""
 
     llm_client = _ensure_openai_client(client)
 
-    # Auto-visuals for P1 Section B and P2 Section A
+    # Auto-visuals for P1 Section B, P2 Section A, and Oral (Stimulus-Based Conversation)
     snapshot: Optional[VisualSnapshot] = None
     visual_description: Optional[str] = None
     wants_visuals = visual_mode in {"embed", "auto"}
     # Fetch visuals for visual sections; for full papers (section is None), fetch for the canonical visual section
-    needs_visuals = (paper_format == "paper_1" and (section in (None, "section_b"))) or (
-        paper_format == "paper_2" and (section in (None, "section_a"))
+    needs_visuals = (
+        (paper_format == "paper_1" and (section in (None, "section_b"))) or
+        (paper_format == "paper_2" and (section in (None, "section_a"))) or
+        (paper_format == "oral")  # Oral exams need visuals for Stimulus-Based Conversation
     )
     if wants_visuals and needs_visuals:
         try:
@@ -652,8 +1416,8 @@ def generate_paper(
             shot_exists=bool(snapshot.screenshot_path and snapshot.screenshot_path.exists()),
         )
 
-    # Helper to generate one section at a time
-    def _gen_one(sec: Optional[str], extra_visual_desc: Optional[str] = None) -> Tuple[str, str]:
+    # Helper to generate one section at a time with validation and retry
+    def _gen_one(sec: Optional[str], extra_visual_desc: Optional[str] = None, max_retries: int = 2) -> Tuple[str, str]:
         pr = _build_prompt(
             difficulty=difficulty,
             paper_format=paper_format,
@@ -674,7 +1438,7 @@ def generate_paper(
                 "Instead, write task instructions that reference the visual and guide students on what to write based on it. "
                 "Write only the task instructions/questions and marking guidance as required, all in English."
             )
-        
+
         # Enhance prompt with RAG context from past papers
         pr = get_rag_enhanced_prompt(
             pr,
@@ -682,53 +1446,112 @@ def generate_paper(
             section=sec,
             topics=list(topics) if topics else None,
             difficulty=difficulty,
-            max_context_chunks=3,
+            max_context_chunks=5,  # Increased for better context
         )
-        
+
+        # Get section-specific temperature
+        section_temp = _get_section_temperature(paper_format, sec)
+
         logger.info(
             "Requesting LLM generated paper",
             difficulty=difficulty,
             paper_format=paper_format,
             section=sec,
             topics=list(topics) if topics else None,
+            temperature=section_temp,
         )
-        try:
-            response_local = llm_client.chat.completions.create(
-                model=settings.openai_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an expert curriculum designer creating official-style English "
-                            "examination papers. All content must be written EXCLUSIVELY in English. "
-                            "Never generate content in any other language, including Urdu, Arabic, or any non-English language."
-                        ),
-                    },
-                    {"role": "user", "content": pr},
-                ],
-                **LLM_COMPLETION_PARAMS,
-            )
-        except Exception as exc:
-            raise PaperGenerationError("Failed to generate paper via LLM") from exc
-        try:
-            out = response_local.choices[0].message.content.strip()
-        except Exception as exc:
-            raise PaperGenerationError("Unexpected response format from LLM") from exc
-        if not out:
-            raise PaperGenerationError("LLM returned empty content for the paper")
-        logger.info(f"LLM content generated | chars={len(out)}")
-        logger.info(f"LLM raw response preview: {out[:2000]}{'...[truncated]' if len(out) > 2000 else ''}")
-        return out, pr
+
+        last_error: Optional[Exception] = None
+        last_issues: List[str] = []
+
+        for attempt in range(max_retries + 1):
+            try:
+                # Build params with section-specific temperature
+                params = {**LLM_COMPLETION_PARAMS, "temperature": section_temp}
+
+                # On retry, slightly increase temperature and add feedback
+                retry_prompt = pr
+                if attempt > 0:
+                    params["temperature"] = min(section_temp + 0.1 * attempt, 0.8)
+                    retry_prompt = pr + f"\n\nPREVIOUS ATTEMPT HAD ISSUES: {'; '.join(last_issues)}. Please fix these issues in this attempt."
+                    logger.info(f"Retry attempt {attempt} with adjusted temperature {params['temperature']}")
+
+                response_local = llm_client.chat.completions.create(
+                    model=settings.openai_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an expert curriculum designer creating official-style English "
+                                "examination papers. All content must be written EXCLUSIVELY in English. "
+                                "Never generate content in any other language, including Urdu, Arabic, or any non-English language. "
+                                "Follow the exact format and structure requirements precisely."
+                            ),
+                        },
+                        {"role": "user", "content": retry_prompt},
+                    ],
+                    **params,
+                )
+
+                out = response_local.choices[0].message.content.strip()
+                if not out:
+                    raise PaperGenerationError("LLM returned empty content for the paper")
+
+                # Validate content
+                is_valid, validation_issues = _validate_content(out, paper_format, sec)
+                llm_issues = _check_common_llm_issues(out)
+
+                all_issues = validation_issues + llm_issues
+
+                if all_issues:
+                    logger.warning(f"Content issues found (attempt {attempt + 1}): {all_issues}")
+                    last_issues = all_issues
+
+                    # Only retry if there are serious issues and we have retries left
+                    serious_issues = [i for i in all_issues if "too short" in i.lower() or "too few" in i.lower() or "non-english" in i.lower()]
+                    if serious_issues and attempt < max_retries:
+                        continue  # Try again
+
+                logger.info(f"LLM content generated | chars={len(out)} | attempt={attempt + 1}")
+                logger.info(f"LLM raw response preview: {out[:2000]}{'...[truncated]' if len(out) > 2000 else ''}")
+
+                return out, pr
+
+            except PaperGenerationError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt < max_retries:
+                    logger.warning(f"Generation attempt {attempt + 1} failed: {exc}")
+                    continue
+                raise PaperGenerationError(f"Failed to generate paper via LLM after {max_retries + 1} attempts") from exc
+
+        # Should not reach here, but just in case
+        if last_error:
+            raise PaperGenerationError("Failed to generate paper via LLM") from last_error
+        raise PaperGenerationError("Failed to generate paper via LLM")
 
     # Generate content: single section or full paper in three calls
     combined_prompts: List[str] = []
+    section_a_error_key: Optional[Dict[str, any]] = None  # Track Section A error key
+    flowchart_answer_key: Optional[Dict[str, any]] = None  # Track flowchart answer key for Paper 2 Section B
+
     if section is not None:
         extra = visual_description if (visual_description and ((paper_format == "paper_1" and section == "section_b") or (paper_format == "paper_2" and section == "section_a"))) else None
         content, pr_used = _gen_one(section, extra)
         combined_prompts.append(pr_used)
+
+        # Extract error key for Section A
+        if paper_format == "paper_1" and section == "section_a":
+            content, section_a_error_key = _extract_section_a_error_key(content)
+        # Extract flowchart answer key for Paper 2 Section B
+        if paper_format == "paper_2" and section == "section_b":
+            content, flowchart_answer_key = _extract_flowchart_answer_key(content)
     else:
         if paper_format == "paper_1":
             a, pr_a = _gen_one("section_a")
+            # Extract error key from Section A before combining
+            a, section_a_error_key = _extract_section_a_error_key(a)
             b, pr_b = _gen_one("section_b", visual_description)
             c, pr_c = _gen_one("section_c")
             content = "\n\n".join([a, b, c])
@@ -736,9 +1559,19 @@ def generate_paper(
         elif paper_format == "paper_2":
             a, pr_a = _gen_one("section_a", visual_description)
             b, pr_b = _gen_one("section_b")
+            # Extract flowchart answer key from Section B before combining
+            b, flowchart_answer_key = _extract_flowchart_answer_key(b)
             c, pr_c = _gen_one("section_c")
             content = "\n\n".join([a, b, c])
             combined_prompts.extend([pr_a, pr_b, pr_c])
+        elif paper_format == "oral":
+            # Generate all three oral components
+            # Visual stimulus is used for the Stimulus-Based Conversation (SBC) section
+            reading, pr_r = _gen_one("reading_aloud")
+            sbc, pr_s = _gen_one("sbc", visual_description)  # Pass visual description to SBC
+            conv, pr_c = _gen_one("conversation")
+            content = "\n\n---\n\n".join([reading, sbc, conv])
+            combined_prompts.extend([pr_r, pr_s, pr_c])
         else:
             # Fallback single prompt
             content, pr_single = _gen_one(None)
@@ -782,6 +1615,20 @@ def generate_paper(
         visual_caption=visual_caption,
     )
 
+    # Upload to Supabase Storage in a per-user, per-paper-type path if user_id is known
+    download_url: Optional[str] = None
+    try:
+        storage_key = f"{base_name}.pdf"
+        if user_id:
+            safe_user = "".join(ch for ch in user_id if ch.isalnum() or ch in {"-", "_"})
+            paper_folder = "paper1" if paper_format == "paper_1" else "paper2" if paper_format == "paper_2" else paper_format
+            storage_key = f"{safe_user}/{paper_folder}/{base_name}.pdf"
+
+        download_url = upload_generated_paper_pdf(pdf_path, object_key=storage_key)
+    except SupabaseError as exc:
+        # Log but don't fail the whole generation if storage is misconfigured
+        logger.error(f"Failed to upload generated paper to Supabase Storage: {exc}")
+
     logger.info(
         "Generated synthetic paper",
         pdf=str(pdf_path),
@@ -791,6 +1638,35 @@ def generate_paper(
         section=section,
         visual_embedded=bool(visual_image_rel),
     )
+
+    # Generate answer key if requested
+    answer_key_data: Optional[Dict[str, any]] = None
+    answer_key_pdf: Optional[Path] = None
+
+    if generate_answer_key_flag:
+        try:
+            logger.info("Generating answer key...")
+            answer_key_result = generate_answer_key(
+                paper_content=content,
+                paper_format=paper_format,
+                section=section,
+                client=llm_client,
+                section_a_error_key=section_a_error_key,  # Pass pre-extracted error key
+            )
+            answer_key_data = answer_key_result.to_dict()
+
+            # Save answer key JSON
+            answer_key_json_path = settings.paper_output_dir / f"{base_name}-answer-key.json"
+            save_answer_key_json(answer_key_result, answer_key_json_path)
+
+            # Render answer key PDF
+            answer_key_pdf = settings.paper_output_dir / f"{base_name}-answer-key.pdf"
+            render_answer_key_pdf(answer_key_result, answer_key_pdf)
+
+            logger.info(f"Answer key generated: {answer_key_pdf}")
+        except AnswerKeyError as exc:
+            logger.error(f"Failed to generate answer key: {exc}")
+            # Don't fail the whole generation, just skip the answer key
 
     return PaperGenerationResult(
         content=content,
@@ -808,6 +1684,10 @@ def generate_paper(
             if snapshot
             else None
         ),
+        download_url=download_url,
+        answer_key=answer_key_data,
+        answer_key_pdf_path=answer_key_pdf,
+        section_a_error_key=section_a_error_key,  # Include extracted error key
     )
 
 
