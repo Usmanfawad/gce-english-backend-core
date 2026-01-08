@@ -40,11 +40,12 @@ def _build_p1_section_a_html(content: str) -> Optional[str]:
         return None
 
     # Build single combined table: Line | Text | Answer
+    # NO visible borders - use invisible table for layout only
     rows_html = [
         "<tr>"
-        "<th style='text-align:center; width:12mm; font-weight:bold;'>Line</th>"
-        "<th style='text-align:left; font-weight:bold;'>Text</th>"
-        "<th style='text-align:center; width:50mm; font-weight:bold;'>Correction</th>"
+        "<th style='text-align:center; width:12mm; font-weight:bold; border:none; padding:4px 8px;'>Line</th>"
+        "<th style='text-align:left; font-weight:bold; border:none; padding:4px 8px;'>Text</th>"
+        "<th style='text-align:center; width:50mm; font-weight:bold; border:none; padding:4px 8px;'>Correction</th>"
         "</tr>"
     ]
     for i in range(1, 13):
@@ -52,14 +53,15 @@ def _build_p1_section_a_html(content: str) -> Optional[str]:
         txt = _inline_markdown_to_html(raw_txt)
         rows_html.append(
             f"<tr>"
-            f"<td style='text-align:center; vertical-align:top;'>{i}</td>"
-            f"<td style='text-align:left; vertical-align:top;'>{txt}</td>"
-            f"<td style='text-align:left; vertical-align:top;'>______________________</td>"
+            f"<td style='text-align:center; vertical-align:top; border:none; padding:4px 8px;'>{i}</td>"
+            f"<td style='text-align:left; vertical-align:top; border:none; padding:4px 8px;'>{txt}</td>"
+            f"<td style='text-align:left; vertical-align:top; border:none; padding:4px 8px;'>______________________</td>"
             f"</tr>"
         )
     
     html = f"""
-    <div class="section">Section A [10 marks] (Editing)</div>
+    <div style="page-break-before:always;"></div>
+    <div class="section" style="font-weight:bold; font-size:14pt; margin:8mm 0 6mm 0; text-transform:uppercase; border-bottom:1px solid #000; padding-bottom:2mm;">SECTION A <span style="font-weight:normal; font-size:12pt;">[10 marks]</span></div>
     <p style="margin-bottom: 4mm;">
         The following passage contains some grammatical errors. Each of the 12 lines may or may not contain one error.
     </p>
@@ -70,7 +72,7 @@ def _build_p1_section_a_html(content: str) -> Optional[str]:
     <p style="margin-bottom: 6mm; font-style: italic;">
         The first and last lines are correct. There are <b>eight</b> errors in total.
     </p>
-    <table class="p1a-lines" style="width:100%; border-collapse:collapse; font-size:11pt;">
+    <table class="p1a-lines" style="width:100%; border-collapse:collapse; border:none; font-size:11pt;">
       {''.join(rows_html)}
     </table>
     """

@@ -238,15 +238,20 @@
       margin-top: 0;
     }
 
-    /* P1 Section A tables */
+    /* P1 Section A tables - NO visible borders */
     table.p1a-lines, table.p1a-answers {
       width: 100%;
       border-collapse: collapse;
+      border: none;
       font-size: 11pt;
     }
-    table.p1a-lines th, table.p1a-lines td,
+    table.p1a-lines th, table.p1a-lines td {
+      border: none !important;
+      padding: 3mm 4mm;
+      vertical-align: top;
+    }
     table.p1a-answers th, table.p1a-answers td {
-      border: 1px solid #000;
+      border: none !important;
       padding: 2mm 2mm;
       vertical-align: top;
     }
